@@ -1,0 +1,15 @@
+[Unit]
+Description=Linux Game Manager read-only web library
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/apps/linux-game-manager
+EnvironmentFile=%h/.config/linux-game-manager/web.env
+ExecStart=/usr/bin/npm start -- --disable-gpu
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>XP Game Manager</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <div><p class="eyebrow">LOCAL-FIRST LIBRARY</p><h1>XP Game Manager</h1></div>
+        <div><button id="discover-games">Discover game info &amp; art</button> <button id="rescan">Rescan libraries</button></div>
+      </header>
+      <section class="intro"><div><h2>Your games, wherever they live</h2><p>Steam installations are discovered automatically. <code>/Beta/WindowsGames</code> is included as the first Windows-game library; add any other mounted folder to browse it too.</p></div><button class="primary" id="add-library">Add library folder</button></section>
+      <div class="library-controls"><input id="search-games" type="search" placeholder="Search your games" /><select id="source-filter"><option value="all">All sources</option><option value="Steam">Steam</option><option value="Server folder">Folder libraries</option></select></div>
+      <p id="status" class="status">Loading your libraries…</p>
+      <div class="library-layout"><div><section><div class="section-title"><h2>Steam</h2><span id="steam-count"></span></div><div id="steam-games" class="game-grid"></div><p id="steam-empty" class="empty" hidden>No installed Steam games were found in the standard Steam locations.</p></section><section><div class="section-title"><h2>Folder libraries</h2><span id="server-count"></span></div><div id="server-libraries" class="server-libraries"></div></section></div><aside id="launcher-panel" class="launcher-panel"><p class="eyebrow">LAUNCHER</p><h2>Select a game</h2><p class="muted">Choose a card to configure a safe launch command.</p></aside></div>
+    </main>
+    <template id="game-card"><article class="game-card" tabindex="0"><div class="game-icon">🎮</div><div><h3></h3><p class="source"></p><p class="compatibility"></p><p class="summary"></p><p class="path"></p></div></article></template>
+    <script src="renderer.js"></script>
+  </body>
+</html>
