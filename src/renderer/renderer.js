@@ -1,6 +1,11 @@
 const $ = (selector) => document.querySelector(selector);
 const cardTemplate = $('#game-card');
 let libraryData = null;
+let torboxSettings = null;
+let torboxJobs = [];
+let torboxRefreshTimer = null;
+const torboxProgress = new Map();
+const minimizedTorboxJobs = new Set();
 
 function gameCard(game) {
   const card = cardTemplate.content.cloneNode(true);
@@ -91,6 +96,177 @@ function renderGlobalProtonSettings() {
   });
   actions.append(installGe, save); panel.append(actions);
   document.querySelector('.intro').after(panel);
+}
+
+function formatBytes(value) {
+  const size = Number(value || 0);
+  if (!size) return 'Unknown size';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']; let unit = 0; let amount = size;
+  while (amount >= 1024 && unit < units.length - 1) { amount /= 1024; unit += 1; }
+  return `${amount.toFixed(unit ? 1 : 0)} ${units[unit]}`;
+}
+
+function progressPercent(progress) {
+  return progress?.totalBytes ? Math.min(100, Math.round((progress.receivedBytes / progress.totalBytes) * 100)) : 0;
+}
+
+function progressElement(progress, label) {
+  const wrapper = document.createElement('div'); wrapper.className = 'transfer-progress';
+  const bar = document.createElement('progress'); bar.max = progress?.totalBytes || 1; bar.value = Math.min(progress?.receivedBytes || 0, progress?.totalBytes || 1);
+  const text = document.createElement('span'); text.textContent = progress?.totalBytes ? `${label} ${progressPercent(progress)}% · ${formatBytes(progress.receivedBytes)} of ${formatBytes(progress.totalBytes)}` : `${label} ${formatBytes(progress?.receivedBytes || 0)} downloaded`;
+  wrapper.append(bar, text); return wrapper;
+}
+
+function isOverallProgress(progress) {
+  return Boolean(progress && Object.prototype.hasOwnProperty.call(progress, 'overallReceivedBytes'));
+}
+
+function switchView(view) {
+  const downloads = view === 'downloads';
+  $('#library-view').hidden = downloads;
+  $('#downloads-view').hidden = !downloads;
+  $('#library-tab').classList.toggle('active', !downloads);
+  $('#downloads-tab').classList.toggle('active', downloads);
+  $('#library-tab').setAttribute('aria-selected', String(!downloads));
+  $('#downloads-tab').setAttribute('aria-selected', String(downloads));
+  clearInterval(torboxRefreshTimer);
+  torboxRefreshTimer = downloads ? setInterval(() => { void loadTorboxJobs(); }, 15000) : null;
+  if (downloads) void loadTorbox();
+}
+
+function downloadsMessage(message, isError = false) {
+  const messageElement = $('#torbox-message');
+  if (messageElement) { messageElement.textContent = message; messageElement.classList.toggle('error', isError); }
+}
+
+function renderTorbox() {
+  const panel = $('#torbox-panel'); panel.replaceChildren();
+  const settings = torboxSettings || { connected: false, destination: '' };
+  const token = input('Torbox API token', '', () => {}, settings.connected ? 'Connected — paste a replacement token to update it' : 'Paste your Torbox API token');
+  const tokenControl = token.querySelector('input'); tokenControl.type = 'password'; tokenControl.autocomplete = 'off';
+  const destination = input('Download directory', settings.destination, () => {}, 'Choose a local directory');
+  const destinationControl = destination.querySelector('input');
+  const destinationRow = document.createElement('div'); destinationRow.className = 'executable-row'; destinationRow.append(destination);
+  const choose = document.createElement('button'); choose.textContent = 'Choose';
+  choose.addEventListener('click', async () => { const picked = await window.libraryApi.chooseTorboxDirectory(); if (picked) destinationControl.value = picked; });
+  destinationRow.append(choose);
+  const save = document.createElement('button'); save.textContent = settings.connected ? 'Save directory / token' : 'Connect Torbox';
+  save.addEventListener('click', async () => {
+    save.disabled = true;
+    try { torboxSettings = await window.libraryApi.saveTorboxSettings({ token: tokenControl.value, destination: destinationControl.value }); renderTorbox(); downloadsMessage(torboxSettings.connected ? 'Torbox settings saved.' : 'Choose an API token to connect Torbox.', !torboxSettings.connected); }
+    catch (error) { downloadsMessage(error.message || 'Unable to save Torbox settings.', true); }
+    finally { save.disabled = false; }
+  });
+  const magnet = document.createElement('label'); magnet.className = 'field'; magnet.innerHTML = '<span>Magnet link</span>';
+  const magnetControl = document.createElement('textarea'); magnetControl.placeholder = 'magnet:?xt=urn:btih:…'; magnetControl.rows = 4; magnet.append(magnetControl);
+  const add = document.createElement('button'); add.className = 'primary'; add.textContent = 'Add to Torbox';
+  const authorization = document.createElement('label'); authorization.className = 'authorization-notice';
+  const authorizationControl = document.createElement('input'); authorizationControl.type = 'checkbox';
+  authorization.append(authorizationControl, ' I confirm I am authorized to download this content.');
+  add.addEventListener('click', async () => {
+    if (!authorizationControl.checked) { downloadsMessage('Confirm that you are authorized to download this content before adding it.', true); return; }
+    add.disabled = true;
+    try { await window.libraryApi.addTorboxMagnet({ magnet: magnetControl.value, destination: destinationControl.value }); magnetControl.value = ''; downloadsMessage('Added to Torbox. Refreshing its status…'); await loadTorboxJobs(); }
+    catch (error) { downloadsMessage(error.message || 'Unable to add the magnet to Torbox.', true); }
+    finally { add.disabled = false; }
+  });
+  const actions = document.createElement('div'); actions.className = 'launcher-actions'; actions.append(save, add);
+  const connection = document.createElement('p'); connection.className = settings.connected ? 'connection-ok' : 'connection-warning'; connection.textContent = settings.connected ? 'Torbox is connected. The API token is kept in encrypted local credential storage.' : 'Connect a Torbox account before adding a magnet.';
+  const message = document.createElement('p'); message.id = 'torbox-message'; message.className = 'status';
+  panel.append(connection, token, destinationRow, magnet, authorization, actions, message);
+}
+
+function renderTorboxJobs() {
+  const container = $('#torbox-jobs'); container.replaceChildren();
+  if (!torboxJobs.length) { const empty = document.createElement('p'); empty.className = 'empty'; empty.textContent = 'No Torbox downloads have been added from this computer.'; container.append(empty); return; }
+  for (const job of torboxJobs) {
+    const minimized = minimizedTorboxJobs.has(job.torrentId);
+    const card = document.createElement('article'); card.className = `download-job${minimized ? ' minimized' : ''}`;
+    const heading = document.createElement('div'); heading.className = 'library-heading';
+    const details = document.createElement('div'); const title = document.createElement('h3'); title.textContent = job.name; const status = document.createElement('p'); status.textContent = `${job.status} · ${job.progress ? `${job.progress}%` : 'waiting for status'}`; details.append(title, status); heading.append(details);
+    const savedFiles = job.savedFiles || {};
+    const pendingFiles = (job.files || []).filter((file) => !savedFiles[file.id]);
+    const overallProgress = torboxProgress.get(`${job.torrentId}:overall`);
+    const controls = document.createElement('div'); controls.className = 'download-controls';
+    const minimize = document.createElement('button'); minimize.textContent = minimized ? 'Expand' : 'Minimize';
+    minimize.addEventListener('click', () => {
+      if (minimized) minimizedTorboxJobs.delete(job.torrentId); else minimizedTorboxJobs.add(job.torrentId);
+      renderTorboxJobs();
+    });
+    controls.append(minimize);
+    if (job.files?.length) {
+      const saveAll = document.createElement('button'); saveAll.className = 'primary'; saveAll.textContent = pendingFiles.length ? `Save ${pendingFiles.length === job.files.length ? 'all files' : 'remaining files'}` : 'All files saved'; saveAll.disabled = !pendingFiles.length || overallProgress?.state === 'downloading' || overallProgress?.state === 'overall';
+      saveAll.addEventListener('click', async () => {
+        const bytes = pendingFiles.reduce((total, file) => total + Number(file.size || 0), 0);
+        if (!window.confirm(`Save ${pendingFiles.length} file${pendingFiles.length === 1 ? '' : 's'} (${formatBytes(bytes)}) to ${job.destination}?`)) return;
+        saveAll.disabled = true; downloadsMessage(`Saving ${job.files.length} Torbox file${job.files.length === 1 ? '' : 's'}…`);
+        try {
+          const results = await window.libraryApi.downloadAllTorboxFiles(job.torrentId);
+          const failed = results.filter((result) => result.error);
+          downloadsMessage(failed.length ? `Saved ${results.length - failed.length} file${results.length - failed.length === 1 ? '' : 's'}; ${failed.length} could not be saved. Use Save file to retry.` : `Saved all ${results.length} file${results.length === 1 ? '' : 's'} to ${job.destination}.`, Boolean(failed.length));
+          await loadTorboxJobs();
+        } catch (error) { downloadsMessage(error.message || 'Unable to save the Torbox files.', true); }
+        finally { saveAll.disabled = false; }
+      });
+      controls.append(saveAll);
+    }
+    const paused = String(job.status || '').toLowerCase() === 'paused';
+    const control = document.createElement('button'); control.textContent = 'Resume';
+    control.addEventListener('click', async () => {
+      control.disabled = true;
+      try { await window.libraryApi.controlTorbox(job.torrentId, 'resume'); await loadTorboxJobs(); downloadsMessage(`Resumed ${job.name}.`); }
+      catch (error) { downloadsMessage(error.message || 'Unable to resume the Torbox download.', true); }
+      finally { control.disabled = false; }
+    });
+    const remove = document.createElement('button'); remove.className = 'quiet'; remove.textContent = 'Delete';
+    remove.addEventListener('click', async () => {
+      if (!window.confirm(`Delete “${job.name}” from Torbox? Files already saved in ${job.destination} will be kept.`)) return;
+      remove.disabled = true;
+      try { await window.libraryApi.controlTorbox(job.torrentId, 'delete'); await loadTorboxJobs(); downloadsMessage(`Deleted ${job.name} from Torbox. Local files were kept.`); }
+      catch (error) { downloadsMessage(error.message || 'Unable to delete the Torbox download.', true); }
+      finally { remove.disabled = false; }
+    });
+    if (paused) controls.append(control);
+    controls.append(remove); heading.append(controls);
+    card.append(heading);
+    if (minimized) { container.append(card); continue; }
+    const destination = document.createElement('p'); destination.className = 'path'; destination.textContent = job.destination; card.append(destination);
+    if (isOverallProgress(overallProgress)) card.append(progressElement({ receivedBytes: overallProgress.overallReceivedBytes || 0, totalBytes: overallProgress.overallTotalBytes || 0 }, overallProgress.state === 'done' ? 'Overall done' : overallProgress.state === 'failed' ? 'Overall finished with errors' : 'Overall'));
+    if (job.files?.length) {
+      const files = document.createElement('div'); files.className = 'download-files';
+      for (const file of job.files) {
+        const row = document.createElement('div'); row.className = 'download-file';
+        const label = document.createElement('span'); label.textContent = `${file.name} · ${formatBytes(file.size)}`;
+        const fileProgress = torboxProgress.get(`${job.torrentId}:${file.id}`);
+        const saved = savedFiles[file.id];
+        const download = document.createElement('button'); download.textContent = saved ? 'Done' : fileProgress?.state === 'downloading' ? 'Saving…' : 'Save file'; download.disabled = Boolean(saved) || fileProgress?.state === 'downloading';
+        download.addEventListener('click', async () => {
+          if (!window.confirm(`Save ${file.name} (${formatBytes(file.size)}) to ${job.destination}?`)) return;
+          download.disabled = true; downloadsMessage(`Getting a Torbox download link for ${file.name}…`);
+          try { const result = await window.libraryApi.downloadTorboxFile(job.torrentId, file.id); downloadsMessage(`Saved ${result.name} to ${result.destination}.`); await loadTorboxJobs(); }
+          catch (error) { downloadsMessage(error.message || 'Unable to save the Torbox file.', true); }
+          finally { download.disabled = false; }
+        });
+        const fileDetails = document.createElement('div'); fileDetails.append(label);
+        if (fileProgress?.state === 'downloading') fileDetails.append(progressElement(fileProgress, 'Saving'));
+        if (saved) { const complete = document.createElement('p'); complete.className = 'transfer-complete'; complete.textContent = `Done · ${saved.destination}`; fileDetails.append(complete); }
+        if (fileProgress?.state === 'failed') { const failed = document.createElement('p'); failed.className = 'transfer-failed'; failed.textContent = fileProgress.error || 'Save failed.'; fileDetails.append(failed); }
+        row.append(fileDetails, download); files.append(row);
+      }
+      card.append(files);
+    } else { const note = document.createElement('p'); note.className = 'muted'; note.textContent = 'Files appear here after Torbox finishes processing the torrent.'; card.append(note); }
+    container.append(card);
+  }
+}
+
+async function loadTorboxJobs() {
+  try { torboxJobs = await window.libraryApi.listTorboxJobs(); renderTorboxJobs(); }
+  catch (error) { downloadsMessage(error.message || 'Unable to refresh Torbox status.', true); }
+}
+
+async function loadTorbox() {
+  try { torboxSettings = await window.libraryApi.getTorboxSettings(); renderTorbox(); await loadTorboxJobs(); }
+  catch (error) { downloadsMessage(error.message || 'Unable to load Torbox settings.', true); }
 }
 
 async function selectGame(game) {
@@ -234,4 +410,13 @@ $('#discover-games').addEventListener('click', async () => {
 });
 $('#search-games').addEventListener('input', renderLibrary);
 $('#source-filter').addEventListener('change', renderLibrary);
+$('#library-tab').addEventListener('click', () => switchView('library'));
+$('#downloads-tab').addEventListener('click', () => switchView('downloads'));
+$('#refresh-downloads').addEventListener('click', loadTorboxJobs);
+window.libraryApi.onTorboxProgress((progress) => {
+  if (progress?.torrentId == null) return;
+  if (progress.fileId != null) torboxProgress.set(`${progress.torrentId}:${progress.fileId}`, progress);
+  if (isOverallProgress(progress)) torboxProgress.set(`${progress.torrentId}:overall`, progress);
+  renderTorboxJobs();
+});
 load();

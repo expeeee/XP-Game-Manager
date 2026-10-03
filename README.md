@@ -13,6 +13,7 @@ Steam games and games kept on a network server.
 - Lets you record a Proton compatibility rating from 0 (no reported support) to 5 (highest support) per game.
 - Provides a command preview before an explicit launch action.
 - Launches Steam games through Steam, or explicitly configured games through a native executable, Wine, or a Proton tool script.
+- Includes a desktop-only Torbox Downloads tab for user-supplied, authorized magnet links. It submits the link to Torbox, shows processing status, and saves selected completed files to a directory you choose.
 - Serves a read-only browser library alongside the desktop app at port `3838`.
 
 ## Read-only web library
@@ -21,7 +22,23 @@ When Linux Game Manager is running, its browser interface is available on the
 home network at `http://<server-ip>:3838/`. It uses the same scanner and saved
 folder-library settings as the desktop application. The web interface exposes
 only the game inventory; it has no configuration, folder-management, or launch
-actions. Its discovery button writes only a local artwork/metadata cache.
+actions. Its discovery button writes only a local artwork/metadata cache. Torbox
+downloads are available only in the desktop app and are never exposed through
+the LAN interface.
+
+## Torbox downloads
+
+In the desktop app, open **Downloads**, enter your Torbox API token, select a
+local destination folder, and paste a magnet link for content you are authorized
+to download. The token is kept using Electron's operating-system credential
+storage; it is not written to game folders or shown in download status. Once
+Torbox has processed the torrent, choose an individual returned file to save it
+to a new subdirectory named after the torrent within the selected directory.
+Existing files are never overwritten.
+
+Each Torbox item can be resumed if it is already paused in Torbox, and has a
+**Delete** control. Delete removes the item from Torbox and this app's local job
+list, but deliberately keeps files already saved on your computer.
 
 Set `LGM_WEB_HOST` or `LGM_WEB_PORT` before starting the app to change the
 bind address or port. For example, `LGM_WEB_HOST=127.0.0.1` keeps it available

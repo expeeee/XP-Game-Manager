@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, safeStorage, shell } = require('electron');
 const fs = require('fs/promises');
 const fsSync = require('fs');
 const http = require('http');
@@ -6,7 +6,7 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
-const { Readable } = require('stream');
+const { Readable, Transform } = require('stream');
 const { pipeline } = require('stream/promises');
 
 const SETTINGS_DIR = process.platform === 'win32'
@@ -16,6 +16,8 @@ const LEGACY_SETTINGS_DIR = process.platform === 'win32' ? path.join(app.getPath
 const SETTINGS_FILE = path.join(SETTINGS_DIR, 'settings.json');
 const GAME_SETTINGS_FILE = path.join(SETTINGS_DIR, 'game-launchers.json');
 const GAME_METADATA_FILE = path.join(SETTINGS_DIR, 'game-metadata.json');
+const TORBOX_SECRET_FILE = path.join(SETTINGS_DIR, 'torbox-secret.bin');
+const TORBOX_JOBS_FILE = path.join(SETTINGS_DIR, 'torbox-jobs.json');
 const GAME_MANIFEST_FILE = '.linux-game-manager.json';
 const DEFAULT_FOLDER_LIBRARIES = process.platform === 'win32' ? [] : ['/Beta/WindowsGames'];
 const WEB_ROOT = path.join(__dirname, 'web');
@@ -24,6 +26,8 @@ const WEB_PORT = Number.parseInt(process.env.XPGM_WEB_PORT || process.env.LGM_WE
 const WEB_ONLY = process.env.XPGM_WEB_ONLY === '1' || process.env.LGM_WEB_ONLY === '1';
 let metadataDiscovery = null;
 let legacySettingsMigrated = false;
+const torboxDownloadLocks = new Set();
+let torboxJobWriteQueue = Promise.resolve();
 async function migrateLegacySettings() { if (legacySettingsMigrated || LEGACY_SETTINGS_DIR === SETTINGS_DIR) return; legacySettingsMigrated = true; for (const filename of ['settings.json', 'game-launchers.json', 'game-metadata.json']) { try { await fs.access(path.join(SETTINGS_DIR, filename)); } catch { try { await fs.mkdir(SETTINGS_DIR, { recursive: true }); await fs.copyFile(path.join(LEGACY_SETTINGS_DIR, filename), path.join(SETTINGS_DIR, filename)); } catch {} } } }
 
 function createWindow() {
@@ -52,6 +56,46 @@ async function readSettings() {
 async function saveSettings(settings) {
   await fs.mkdir(SETTINGS_DIR, { recursive: true });
   await fs.writeFile(SETTINGS_FILE, JSON.stringify(settings, null, 2));
+}
+
+function secureStorageAvailable() {
+  if (!safeStorage.isEncryptionAvailable()) return false;
+  return process.platform !== 'linux' || safeStorage.getSelectedStorageBackend() !== 'basic_text';
+}
+
+async function readTorboxToken() {
+  if (!secureStorageAvailable()) return '';
+  try {
+    const encrypted = await fs.readFile(TORBOX_SECRET_FILE);
+    return safeStorage.decryptString(encrypted);
+  } catch { return ''; }
+}
+
+async function saveTorboxToken(token) {
+  if (!secureStorageAvailable()) throw new Error('Secure credential storage requires an available operating-system keyring on this computer.');
+  await fs.mkdir(SETTINGS_DIR, { recursive: true });
+  await fs.writeFile(TORBOX_SECRET_FILE, safeStorage.encryptString(token.trim()), { mode: 0o600 });
+}
+
+async function readTorboxJobs() {
+  try { const jobs = JSON.parse(await fs.readFile(TORBOX_JOBS_FILE, 'utf8')); return Array.isArray(jobs) ? jobs : []; }
+  catch { return []; }
+}
+
+async function saveTorboxJobs(jobs) {
+  await fs.mkdir(SETTINGS_DIR, { recursive: true });
+  await fs.writeFile(TORBOX_JOBS_FILE, JSON.stringify(jobs, null, 2));
+}
+
+function updateTorboxJobs(update) {
+  const work = torboxJobWriteQueue.then(async () => {
+    const jobs = await readTorboxJobs();
+    const result = await update(jobs);
+    await saveTorboxJobs(jobs);
+    return result;
+  });
+  torboxJobWriteQueue = work.catch(() => {});
+  return work;
 }
 
 async function readGameSettings() {
@@ -486,6 +530,213 @@ function startReadOnlyWebServer() {
   return server;
 }
 
+const TORBOX_API = 'https://api.torbox.app/v1/api';
+
+function torboxError(payload, fallback) {
+  return payload?.detail || payload?.error || payload?.message || fallback;
+}
+
+async function torboxRequest(endpoint, options = {}, tokenOverride = '') {
+  const token = tokenOverride || await readTorboxToken();
+  if (!token) throw new Error('Connect Torbox with an API token before adding a download.');
+  const response = await fetch(`${TORBOX_API}${endpoint}`, {
+    ...options,
+    headers: { Authorization: `Bearer ${token}`, ...(options.headers || {}) }
+  });
+  let payload = null;
+  try { payload = await response.json(); } catch { /* Torbox errors are normally JSON. */ }
+  if (!response.ok || payload?.success === false) throw new Error(torboxError(payload, `Torbox request failed (${response.status}).`));
+  return payload?.data ?? payload;
+}
+
+function torboxFiles(item) {
+  const files = Array.isArray(item?.files) ? item.files : [];
+  return files.map((file, index) => ({
+    id: Number.isInteger(file?.id) ? file.id : index,
+    name: typeof file?.name === 'string' ? file.name : typeof file?.short_name === 'string' ? file.short_name : `File ${index + 1}`,
+    size: Number(file?.size || 0),
+    mimeType: typeof file?.mimetype === 'string' ? file.mimetype : ''
+  }));
+}
+
+function torboxJob(item, current = {}) {
+  const { magnet: _magnet, ...safeCurrent } = current;
+  const id = Number(item?.id ?? item?.torrent_id ?? current.torrentId);
+  if (!Number.isInteger(id) || id < 1) throw new Error('Torbox did not return a usable torrent ID.');
+  return {
+    ...safeCurrent,
+    torrentId: id,
+    name: typeof item?.name === 'string' ? item.name : current.name || `Torrent ${id}`,
+    status: String(item?.download_state || item?.status || current.status || 'queued'),
+    progress: Number(item?.progress ?? current.progress ?? 0),
+    files: torboxFiles(item).length ? torboxFiles(item) : (current.files || []),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function isContainedPath(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative !== '' && !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative);
+}
+
+async function resolveTorboxDestination(job) {
+  const configuredRoot = job.destinationRoot || path.dirname(job.destination || '');
+  if (!configuredRoot || !job.destination) throw new Error('This download has no valid destination directory.');
+  let root;
+  let destination;
+  try { root = await fs.realpath(configuredRoot); destination = await fs.realpath(job.destination); }
+  catch { throw new Error('Choose an available destination directory before downloading files.'); }
+  if (!isContainedPath(root, destination)) throw new Error('The download directory is outside its selected destination.');
+  return { destination };
+}
+
+function validateMagnet(value) {
+  if (typeof value !== 'string' || value.length > 16384) throw new Error('Paste a valid magnet link.');
+  let parsed;
+  try { parsed = new URL(value.trim()); } catch { throw new Error('Paste a valid magnet link.'); }
+  if (parsed.protocol !== 'magnet:' || !parsed.searchParams.get('xt')) throw new Error('Paste a valid magnet link with an info hash.');
+  return value.trim();
+}
+
+async function getTorboxItems(id) {
+  const query = id ? `?id=${encodeURIComponent(id)}` : '?limit=1000';
+  const data = await torboxRequest(`/torrents/mylist${query}`);
+  return Array.isArray(data) ? data : Array.isArray(data?.torrents) ? data.torrents : data ? [data] : [];
+}
+
+async function refreshTorboxJobs() {
+  const jobs = await readTorboxJobs();
+  if (!jobs.length) return jobs;
+  const items = await getTorboxItems();
+  const byId = new Map(items.map((item) => [Number(item?.id ?? item?.torrent_id), item]));
+  return updateTorboxJobs((currentJobs) => {
+    const refreshed = currentJobs.map((job) => byId.has(job.torrentId) ? torboxJob(byId.get(job.torrentId), job) : job);
+    currentJobs.splice(0, currentJobs.length, ...refreshed);
+    return refreshed;
+  });
+}
+
+function safeDownloadName(name, fallback) {
+  const base = path.basename(String(name || fallback)).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim();
+  return base && base !== '.' && base !== '..' ? base.slice(0, 180) : fallback;
+}
+
+async function recordTorboxFileSaved(torrentId, fileId, result) {
+  await updateTorboxJobs((jobs) => {
+    const job = jobs.find((item) => item.torrentId === torrentId);
+    if (job) job.savedFiles = { ...(job.savedFiles || {}), [fileId]: { name: result.name, destination: result.destination, completedAt: new Date().toISOString() } };
+  });
+}
+
+async function downloadTorboxFileFromJob(job, fileId, report = null) {
+  const { destination: downloadDirectory } = await resolveTorboxDestination(job);
+  const file = job.files.find((item) => item.id === Number(fileId));
+  if (!file) throw new Error('Torbox did not return that file. Refresh the download first.');
+  const lockKey = `${job.torrentId}:${file.id}`;
+  if (torboxDownloadLocks.has(lockKey)) throw new Error('This file is already being saved.');
+  torboxDownloadLocks.add(lockKey);
+  try {
+  const token = await readTorboxToken();
+  if (!token) throw new Error('Connect Torbox with an API token before downloading files.');
+  const link = new URL(`${TORBOX_API}/torrents/requestdl`);
+  link.searchParams.set('token', token);
+  link.searchParams.set('torrent_id', String(job.torrentId));
+  link.searchParams.set('file_id', String(file.id));
+  const response = await fetch(link, { redirect: 'follow' });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok || payload?.success === false) throw new Error(torboxError(payload, `Torbox download-link request failed (${response.status}).`));
+  const downloadUrl = typeof (payload?.data ?? payload) === 'string' ? (payload.data ?? payload) : (payload?.data?.url || payload?.url);
+  if (!downloadUrl || !/^https:\/\//i.test(downloadUrl)) throw new Error('Torbox did not return a usable download link.');
+  const destination = path.resolve(downloadDirectory, safeDownloadName(file.name, `torbox-${job.torrentId}-${file.id}`));
+  if (path.dirname(destination) !== downloadDirectory) throw new Error('The requested file name is unsafe.');
+  try { await fs.access(destination); throw new Error(`${path.basename(destination)} already exists. Rename or move it before downloading.`); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  const partial = `${destination}.${crypto.randomUUID()}.part`;
+  const fileResponse = await fetch(downloadUrl, { redirect: 'follow' });
+  if (!fileResponse.ok || !fileResponse.body) throw new Error(`The Torbox download failed (${fileResponse.status}).`);
+  const totalBytes = Number.parseInt(fileResponse.headers.get('content-length') || '', 10) || file.size || 0;
+  let receivedBytes = 0;
+  report?.({ state: 'downloading', torrentId: job.torrentId, fileId: file.id, receivedBytes, totalBytes });
+  const counter = new Transform({ transform(chunk, encoding, callback) {
+    receivedBytes += chunk.length;
+    report?.({ state: 'downloading', torrentId: job.torrentId, fileId: file.id, receivedBytes, totalBytes });
+    callback(null, chunk);
+  } });
+  try {
+    await pipeline(Readable.fromWeb(fileResponse.body), counter, fsSync.createWriteStream(partial, { flags: 'wx' }));
+    await fs.rename(partial, destination);
+  } catch (error) {
+    try { await fs.rm(partial, { force: true }); } catch {}
+    throw error;
+  }
+  const result = { name: path.basename(destination), destination, bytes: receivedBytes || totalBytes };
+  await recordTorboxFileSaved(job.torrentId, file.id, result);
+  report?.({ state: 'done', torrentId: job.torrentId, fileId: file.id, receivedBytes: result.bytes, totalBytes: totalBytes || result.bytes });
+  return result;
+  } finally {
+    torboxDownloadLocks.delete(lockKey);
+  }
+}
+
+async function downloadTorboxFile(jobId, fileId, report = null) {
+  const jobs = await refreshTorboxJobs();
+  const job = jobs.find((item) => item.torrentId === Number(jobId));
+  if (!job) throw new Error('That Torbox download is not tracked by this app.');
+  return downloadTorboxFileFromJob(job, fileId, report);
+}
+
+async function downloadAllTorboxFiles(jobId, report = null) {
+  const jobs = await refreshTorboxJobs();
+  const job = jobs.find((item) => item.torrentId === Number(jobId));
+  if (!job) throw new Error('That Torbox download is not tracked by this app.');
+  if (!job.files.length) throw new Error('Torbox has not returned any files for this download yet.');
+  const pendingFiles = job.files.filter((file) => !job.savedFiles?.[file.id]);
+  if (!pendingFiles.length) return [];
+  const totalBytes = pendingFiles.reduce((total, file) => total + Number(file.size || 0), 0);
+  let completedBytes = 0;
+  const reportOverall = (progress) => {
+    const effectiveTotal = totalBytes || progress.totalBytes || 0;
+    report?.({ ...progress, overallReceivedBytes: completedBytes + progress.receivedBytes, overallTotalBytes: effectiveTotal });
+  };
+  const results = [];
+  for (const file of pendingFiles) {
+    try {
+      const result = await downloadTorboxFileFromJob(job, file.id, reportOverall);
+      completedBytes += result.bytes || file.size || 0;
+      report?.({ state: 'overall', torrentId: job.torrentId, overallReceivedBytes: completedBytes, overallTotalBytes: totalBytes });
+      results.push({ fileId: file.id, name: file.name, ...result, error: '' });
+    } catch (error) {
+      report?.({ state: 'failed', torrentId: job.torrentId, fileId: file.id, error: error.message || 'Unable to save this file.' });
+      results.push({ fileId: file.id, name: file.name, error: error.message || 'Unable to save this file.' });
+    }
+  }
+  const failures = results.filter((result) => result.error).length;
+  report?.({ state: failures ? 'failed' : 'done', torrentId: job.torrentId, overallReceivedBytes: completedBytes, overallTotalBytes: totalBytes, error: failures ? `${failures} file${failures === 1 ? '' : 's'} could not be saved.` : '' });
+  return results;
+}
+
+async function controlTorboxTorrent(torrentId, operation) {
+  const id = Number(torrentId);
+  if (!Number.isInteger(id) || id < 1) throw new Error('Choose a valid Torbox download.');
+  if (!['reannounce', 'resume', 'delete'].includes(operation)) throw new Error('Unsupported Torbox control operation.');
+  await torboxRequest('/torrents/controltorrent', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ torrent_id: id, operation })
+  });
+  const jobs = await readTorboxJobs();
+  if (operation === 'delete') {
+    await saveTorboxJobs(jobs.filter((job) => job.torrentId !== id));
+    return { deleted: true };
+  }
+  const job = jobs.find((item) => item.torrentId === id);
+  if (job) {
+    job.status = operation === 'resume' ? 'queued' : job.status;
+    job.updatedAt = new Date().toISOString();
+    await saveTorboxJobs(jobs);
+  }
+  return { deleted: false, status: job?.status || '' };
+}
+
 ipcMain.handle('library:load', loadLibrary);
 ipcMain.handle('library:discover-metadata', discoverGameMetadata);
 ipcMain.handle('library:apply-store-app-id', async (_event, game, appId) => applyStoreAppId(game, appId));
@@ -509,6 +760,69 @@ ipcMain.handle('library:remove-folder', async (_event, folder) => {
   await saveSettings(settings);
   return settings.serverLibraries;
 });
+
+ipcMain.handle('torbox:get-settings', async () => {
+  const settings = await readSettings();
+  return { connected: Boolean(await readTorboxToken()), destination: typeof settings.torboxDownloadDirectory === 'string' ? settings.torboxDownloadDirectory : '' };
+});
+
+ipcMain.handle('torbox:save-settings', async (_event, configuration) => {
+  if (!configuration || typeof configuration !== 'object') throw new Error('Invalid Torbox settings.');
+  const token = typeof configuration.token === 'string' ? configuration.token.trim() : '';
+  if (token) { await torboxRequest('/user/me', {}, token); await saveTorboxToken(token); }
+  const settings = await readSettings();
+  settings.torboxDownloadDirectory = typeof configuration.destination === 'string' ? configuration.destination.trim() : '';
+  await saveSettings(settings);
+  return { connected: Boolean(await readTorboxToken()), destination: settings.torboxDownloadDirectory };
+});
+
+ipcMain.handle('torbox:choose-directory', async () => {
+  const result = await dialog.showOpenDialog({ title: 'Choose Torbox download directory', properties: ['openDirectory', 'createDirectory'] });
+  return result.canceled ? null : result.filePaths[0];
+});
+
+ipcMain.handle('torbox:add-magnet', async (_event, configuration) => {
+  const magnet = validateMagnet(configuration?.magnet);
+  const destinationRoot = typeof configuration?.destination === 'string' ? configuration.destination.trim() : '';
+  if (!destinationRoot || !(await directoryExists(destinationRoot))) throw new Error('Choose an available download directory.');
+  try { await fs.access(destinationRoot, fsSync.constants.W_OK); }
+  catch { throw new Error('Choose a writable download directory.'); }
+  const body = new FormData();
+  body.set('magnet', magnet);
+  body.set('seed', '0');
+  body.set('allow_zip', 'false');
+  body.set('as_queued', 'false');
+  const created = await torboxRequest('/torrents/createtorrent', { method: 'POST', body });
+  const candidate = Array.isArray(created) ? created[0] : created;
+  const job = torboxJob(candidate, { status: 'queued', files: [] });
+  const root = await fs.realpath(destinationRoot);
+  const destination = path.resolve(root, `${safeDownloadName(job.name, 'torbox')}-${job.torrentId}`);
+  if (!isContainedPath(root, destination)) throw new Error('Torbox returned an unsafe torrent name.');
+  const jobs = await readTorboxJobs();
+  const index = jobs.findIndex((item) => item.torrentId === job.torrentId);
+  if (index >= 0) return jobs[index];
+  try { await fs.mkdir(destination); }
+  catch (error) {
+    if (error.code === 'EEXIST') throw new Error('A download directory for this Torbox item already exists. Choose a different destination directory.');
+    throw error;
+  }
+  const resolvedDestination = await fs.realpath(destination);
+  if (!isContainedPath(root, resolvedDestination)) throw new Error('The Torbox download directory must not be a symbolic link.');
+  job.destinationRoot = root;
+  job.destination = resolvedDestination;
+  jobs.unshift(job);
+  await saveTorboxJobs(jobs);
+  return job;
+});
+
+ipcMain.handle('torbox:list', async () => refreshTorboxJobs());
+ipcMain.handle('torbox:download-file', async (event, jobId, fileId) => {
+  const report = (progress) => event.sender.send('torbox:progress', progress);
+  try { return await downloadTorboxFile(jobId, fileId, report); }
+  catch (error) { report({ state: 'failed', torrentId: Number(jobId), fileId: Number(fileId), error: error.message || 'Unable to save this file.' }); throw error; }
+});
+ipcMain.handle('torbox:download-all-files', async (event, jobId) => downloadAllTorboxFiles(jobId, (progress) => event.sender.send('torbox:progress', progress)));
+ipcMain.handle('torbox:control', async (_event, torrentId, operation) => controlTorboxTorrent(torrentId, operation));
 
 ipcMain.handle('settings:save-proton', async (_event, configuration) => {
   if (process.platform !== 'linux') throw new Error('Global Proton settings are only available on Linux.');
