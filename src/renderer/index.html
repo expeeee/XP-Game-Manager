@@ -2,6 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' https://cdn.akamai.steamstatic.com https://shared.akamai.steamstatic.com data:; style-src 'self' 'unsafe-inline'; script-src 'self'; base-uri 'none';" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>XP Game Manager</title>
     <link rel="stylesheet" href="styles.css" />
@@ -18,7 +19,44 @@
         <div class="library-layout"><div><section><div class="section-title"><h2>Steam</h2><span id="steam-count"></span></div><div id="steam-games" class="game-grid"></div><p id="steam-empty" class="empty" hidden>No installed Steam games were found in the standard Steam locations.</p></section><section><div class="section-title"><h2>Folder libraries</h2><span id="server-count"></span></div><div id="server-libraries" class="server-libraries"></div></section></div><aside id="launcher-panel" class="launcher-panel"><p class="eyebrow">LAUNCHER</p><h2>Select a game</h2><p class="muted">Choose a card to configure a safe launch command.</p></aside></div></div>
       <section id="downloads-view" hidden><div class="downloads-heading"><div><p class="eyebrow">TORBOX</p><h2>Downloads</h2><p class="muted">Paste a magnet link for content you are authorized to download. Torbox transfers it to your chosen folder.</p></div><button id="refresh-downloads">Refresh status</button></div><div id="torbox-panel" class="download-panel"></div><div id="torbox-jobs" class="download-jobs"></div></section>
     </main>
-    <template id="game-card"><article class="game-card" tabindex="0"><div class="game-icon">🎮</div><div><h3></h3><p class="source"></p><p class="compatibility"></p><p class="summary"></p><p class="path"></p></div></article></template>
+    <template id="game-card"><article class="game-card" tabindex="0"><div class="game-icon">🎮</div><div><div class="card-header"><h3></h3><span class="protondb-badge" hidden></span></div><p class="source"></p><p class="compatibility"></p><p class="summary"></p><p class="path"></p></div></article></template>
+
+    <!-- Debug Terminal Drawer -->
+    <div id="debug-drawer" class="debug-drawer collapsed">
+      <div class="debug-drawer-header">
+        <div class="debug-drawer-title">
+          <span class="debug-icon">💻</span>
+          <strong>Launch Console &amp; Debug Logs</strong>
+          <span id="launch-status-badge" class="badge idle">Idle</span>
+        </div>
+        <div class="debug-drawer-actions">
+          <button id="clear-debug-logs" class="button-small">Clear Log</button>
+          <button id="toggle-debug-drawer" class="button-small">Expand Log Terminal</button>
+        </div>
+      </div>
+      <div class="debug-drawer-body">
+        <pre id="debug-terminal-logs" class="terminal-logs">XP Game Manager Console initialized. Ready for launch logs...</pre>
+      </div>
+    </div>
+
+    <!-- Steam Search Modal -->
+    <div id="steam-search-modal" class="modal-overlay" hidden>
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3>Search Steam Store for App ID</h3>
+          <button id="close-steam-search" class="button-small">✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="search-input-group">
+            <input type="search" id="steam-search-input" placeholder="Enter game title (e.g. Witcher 3)..." />
+            <button id="steam-search-btn" class="primary">Search</button>
+          </div>
+          <p id="steam-search-status" class="status"></p>
+          <div id="steam-search-results" class="search-results-list"></div>
+        </div>
+      </div>
+    </div>
+
     <script src="renderer.js"></script>
   </body>
 </html>

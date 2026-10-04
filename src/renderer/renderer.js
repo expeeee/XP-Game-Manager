@@ -14,15 +14,34 @@ function gameCard(game) {
   cover.className = 'game-cover';
   if (game.artUrl) {
     const image = document.createElement('img'); image.src = game.artUrl; image.alt = '';
-    image.addEventListener('error', () => image.remove()); cover.append(image);
+    image.addEventListener('error', () => {
+      image.remove();
+      if (!cover.textContent) cover.textContent = game.source === 'Steam' ? 'STEAM' : 'WINDOWS';
+    });
+    cover.append(image);
   }
   if (!game.artUrl) cover.textContent = game.source === 'Steam' ? 'STEAM' : 'WINDOWS';
   article.prepend(cover);
   card.querySelector('h3').textContent = game.name;
+
+  if (game.protonDb?.tier) {
+    const badge = card.querySelector('.protondb-badge');
+    if (badge) {
+      const tier = String(game.protonDb.tier).toLowerCase();
+      badge.textContent = tier.toUpperCase();
+      badge.className = `protondb-badge ${tier}`;
+      badge.hidden = false;
+    }
+  }
+
   card.querySelector('.source').textContent = game.available ? game.source : `${game.source} · missing files`;
-  card.querySelector('.compatibility').textContent = `Proton support ${game.protonCompatibility || 0}/5`;
+
+  const ratingText = game.protonDb?.tier
+    ? `ProtonDB: ${game.protonDb.tier.toUpperCase()} (${game.protonDb.total || 0} reports)`
+    : `Proton support ${game.protonCompatibility || 0}/5`;
+  card.querySelector('.compatibility').textContent = ratingText;
   if (game.genres?.length) card.querySelector('.compatibility').textContent += ` · ${game.genres.join(', ')}`;
-  card.querySelector('.summary').textContent = game.description || '';
+
   if (libraryData?.hostPlatform === 'win32') {
     const compatibility = card.querySelector('.compatibility');
     compatibility.textContent = game.genres?.join(', ') || '';
@@ -95,6 +114,74 @@ function renderGlobalProtonSettings() {
     finally { save.disabled = false; }
   });
   actions.append(installGe, save); panel.append(actions);
+
+  // Diagnostics UI Container
+  const diagContainer = document.createElement('div');
+  diagContainer.className = 'health-diagnostics-container';
+  diagContainer.style.marginTop = '16px';
+  diagContainer.style.padding = '12px';
+  diagContainer.style.background = 'rgba(0, 0, 0, 0.2)';
+  diagContainer.style.borderRadius = '8px';
+  diagContainer.style.border = '1px solid rgba(255, 255, 255, 0.1)';
+
+  const diagHeader = document.createElement('div');
+  diagHeader.style.display = 'flex'; diagHeader.style.justifyContent = 'space-between'; diagHeader.style.alignItems = 'center';
+  const diagTitle = document.createElement('h4'); diagTitle.style.margin = '0'; diagTitle.textContent = 'Host System Health & Driver Diagnostics';
+  const runDiagBtn = document.createElement('button'); runDiagBtn.textContent = 'Run Health Check';
+
+  diagHeader.append(diagTitle, runDiagBtn);
+  const diagResultsArea = document.createElement('div');
+  diagResultsArea.style.marginTop = '12px';
+  diagResultsArea.className = 'health-results-list';
+
+  const runHealthCheck = async () => {
+    runDiagBtn.disabled = true;
+    diagResultsArea.innerHTML = '<p class="muted">Scanning system Vulkan drivers, Wine runners, and utilities...</p>';
+    try {
+      const health = await window.libraryApi.diagnoseSystemHealth();
+      diagResultsArea.replaceChildren();
+      const items = [
+        { title: '64-bit Vulkan ICDs', data: health.vulkan64 },
+        { title: '32-bit Vulkan ICDs', data: health.vulkan32 },
+        { title: 'Wine Binary', data: health.wine },
+        { title: 'UMU Launcher', data: health.umu },
+        { title: 'GE-Proton Builds', data: health.geProton },
+        { title: 'GameMode Utility', data: health.gamemode },
+        { title: 'MangoHud Overlay', data: health.mangohud },
+        { title: 'Unzip Utility', data: health.unzip },
+        { title: 'NTLM Auth (winbind)', data: health.ntlmAuth },
+        { title: 'Esync File Limit (ulimit -n)', data: health.ulimit }
+      ];
+
+      for (const item of items) {
+        const row = document.createElement('div');
+        row.style.display = 'flex'; row.style.alignItems = 'center'; row.style.gap = '10px'; row.style.marginBottom = '6px';
+        const badge = document.createElement('span');
+        badge.style.padding = '2px 8px'; badge.style.borderRadius = '4px'; badge.style.fontSize = '0.75rem'; badge.style.fontWeight = 'bold';
+        if (item.data.status === 'PASS') {
+          badge.style.background = '#1b5e20'; badge.style.color = '#81c784'; badge.textContent = 'PASS';
+        } else if (item.data.status === 'WARNING') {
+          badge.style.background = '#e65100'; badge.style.color = '#ffb74d'; badge.textContent = 'WARNING';
+        } else {
+          badge.style.background = '#b71c1c'; badge.style.color = '#ef9a9a'; badge.textContent = 'MISSING';
+        }
+        const text = document.createElement('span');
+        text.innerHTML = `<strong>${item.title}:</strong> <span class="muted">${item.data.details}</span>`;
+        row.append(badge, text);
+        diagResultsArea.append(row);
+      }
+    } catch (err) {
+      diagResultsArea.innerHTML = `<p class="error">Health check failed: ${err.message}</p>`;
+    } finally {
+      runDiagBtn.disabled = false;
+    }
+  };
+
+  runDiagBtn.addEventListener('click', runHealthCheck);
+  diagContainer.append(diagHeader, diagResultsArea);
+  panel.append(diagContainer);
+  runHealthCheck();
+
   document.querySelector('.intro').after(panel);
 }
 
@@ -264,6 +351,9 @@ async function loadTorboxJobs() {
   catch (error) { downloadsMessage(error.message || 'Unable to refresh Torbox status.', true); }
 }
 
+let activeGameForSearch = null;
+let discoveredProtonTools = [];
+
 async function loadTorbox() {
   try { torboxSettings = await window.libraryApi.getTorboxSettings(); renderTorbox(); await loadTorboxJobs(); }
   catch (error) { downloadsMessage(error.message || 'Unable to load Torbox settings.', true); }
@@ -271,7 +361,26 @@ async function loadTorbox() {
 
 async function selectGame(game) {
   const saved = await window.libraryApi.getLauncher(game.id);
-  const config = saved || { runner: game.source === 'Steam' ? 'steam' : 'wine', executable: game.suggestedExecutable || '', workingDirectory: game.suggestedWorkingDirectory || game.path, wineBinary: 'wine', winePrefix: game.defaultCompatDataPath || '', protonPath: libraryData?.protonSettings?.protonPath || '', umuPath: libraryData?.protonSettings?.umuPath || 'umu-run', arguments: game.suggestedArguments?.join(' ') || '', protonCompatibility: game.protonCompatibility || 0, runsOn: game.runsOn || { windows: true, linux: true } };
+  const config = saved || {
+    runner: game.source === 'Steam' ? 'steam' : 'wine',
+    executable: game.suggestedExecutable || '',
+    workingDirectory: game.suggestedWorkingDirectory || game.path,
+    wineBinary: 'wine',
+    winePrefix: game.defaultCompatDataPath || '',
+    protonPath: libraryData?.protonSettings?.protonPath || '',
+    umuPath: libraryData?.protonSettings?.umuPath || 'umu-run',
+    arguments: game.suggestedArguments?.join(' ') || '',
+    protonCompatibility: game.protonCompatibility || 0,
+    runsOn: game.runsOn || { windows: true, linux: true },
+    gameMode: false,
+    mangoHud: false,
+    useWineD3D: false,
+    noEsync: false,
+    noFsync: false,
+    dxvkHud: '',
+    store: '',
+    umuGameId: ''
+  };
   if (libraryData?.hostPlatform === 'win32' && !['steam', 'native'].includes(config.runner)) config.runner = game.source === 'Steam' ? 'steam' : 'native';
   if (libraryData?.hostPlatform === 'linux' && config.runner === 'proton') {
     config.protonPath ||= libraryData.protonSettings?.protonPath || '';
@@ -299,6 +408,7 @@ function renderLauncher(game, config) {
   }
   const runnerField = document.createElement('label'); runnerField.className = 'field'; runnerField.innerHTML = '<span>Runner</span>'; runnerField.append(runner); panel.append(runnerField);
   runner.addEventListener('change', () => { config.runner = runner.value; renderLauncher(game, config); });
+
   const protonSettings = document.createElement('div');
   const compatibility = document.createElement('select');
   for (let rating = 0; rating <= 5; rating += 1) {
@@ -306,7 +416,7 @@ function renderLauncher(game, config) {
     item.textContent = rating === 0 ? '0 / 5 — No reported support' : `${rating} / 5${rating === 5 ? ' — Highest support' : ''}`;
     item.selected = config.protonCompatibility === rating; compatibility.append(item);
   }
-  const compatibilityField = document.createElement('label'); compatibilityField.className = 'field'; compatibilityField.innerHTML = '<span>Proton compatibility</span>'; compatibilityField.append(compatibility); protonSettings.append(compatibilityField);
+  const compatibilityField = document.createElement('label'); compatibilityField.className = 'field'; compatibilityField.innerHTML = '<span>Proton compatibility rating</span>'; compatibilityField.append(compatibility); protonSettings.append(compatibilityField);
   compatibility.addEventListener('change', () => { config.protonCompatibility = Number(compatibility.value); });
   const platforms = document.createElement('div'); platforms.className = 'platforms';
   for (const platform of ['windows', 'linux']) { const label = document.createElement('label'); const box = document.createElement('input'); box.type = 'checkbox'; box.checked = config.runsOn[platform]; box.addEventListener('change', () => { config.runsOn[platform] = box.checked; }); label.append(box, ` Runs on ${platform === 'windows' ? 'Windows' : 'Linux'}`); platforms.append(label); }
@@ -316,24 +426,29 @@ function renderLauncher(game, config) {
     const summary = document.createElement('summary'); summary.textContent = 'Advanced Proton settings';
     advanced.append(summary, protonSettings); panel.append(advanced);
   } else panel.append(protonSettings);
+
   const storeId = input('Steam App ID (optional)', game.storeAppId || '', () => {}, 'Auto-match, App ID, or Steam Store URL');
   const storeIdControl = storeId.querySelector('input');
-  const applyStoreId = document.createElement('button'); applyStoreId.textContent = 'Find / fetch game info & art';
+  const applyStoreId = document.createElement('button'); applyStoreId.textContent = 'Apply App ID';
   applyStoreId.addEventListener('click', async () => {
     $('#status').textContent = 'Fetching Steam game information…';
     try { await window.libraryApi.applyStoreAppId(game, storeIdControl.value.trim()); await load(); $('#status').textContent = 'Steam game information applied.'; }
     catch (error) { $('#status').textContent = error.message || 'Unable to fetch Steam game information.'; }
   });
-  const storeIdActions = document.createElement('div'); storeIdActions.className = 'launcher-actions'; storeIdActions.append(applyStoreId); panel.append(storeId, storeIdActions);
+  const searchStore = document.createElement('button'); searchStore.textContent = 'Search Steam Store';
+  searchStore.addEventListener('click', () => openSteamSearchModal(game));
+
+  const storeIdActions = document.createElement('div'); storeIdActions.className = 'launcher-actions'; storeIdActions.append(applyStoreId, searchStore); panel.append(storeId, storeIdActions);
   if (game.protonDbUrl) {
     const protonDbLink = document.createElement('a');
     protonDbLink.className = 'button-link';
     protonDbLink.href = game.protonDbUrl;
     protonDbLink.target = '_blank';
     protonDbLink.rel = 'noreferrer';
-    protonDbLink.textContent = 'View on ProtonDB';
+    protonDbLink.textContent = game.protonDb?.tier ? `ProtonDB (${game.protonDb.tier.toUpperCase()})` : 'View on ProtonDB';
     storeIdActions.append(protonDbLink);
   }
+
   if (config.runner === 'steam') panel.insertAdjacentHTML('beforeend', libraryData?.hostPlatform === 'win32'
     ? '<p class="hint">Steam launches this game with its own configured settings.</p>'
     : '<p class="hint">Steam launches this game with the Proton version and compatibility settings already configured in Steam.</p>');
@@ -349,12 +464,110 @@ function renderLauncher(game, config) {
       panel.append(input('Wine prefix (optional)', config.winePrefix, value => { config.winePrefix = value; }, '/path/to/prefix'));
     }
     if (config.runner === 'proton') {
-      panel.append(input('GE-Proton directory', config.protonPath, value => { config.protonPath = value; }, '/path/to/GE-Proton')); 
+      const protonField = document.createElement('label'); protonField.className = 'field'; protonField.innerHTML = '<span>GE-Proton directory / tool</span>';
+      const protonSelect = document.createElement('select');
+      const customOpt = document.createElement('option'); customOpt.value = 'custom'; customOpt.textContent = 'Custom Path...';
+      protonSelect.append(customOpt);
+      for (const tool of discoveredProtonTools) {
+        const opt = document.createElement('option'); opt.value = tool.path; opt.textContent = tool.name;
+        if (config.protonPath === tool.path) opt.selected = true;
+        protonSelect.append(opt);
+      }
+      if (!discoveredProtonTools.some(t => t.path === config.protonPath) && config.protonPath) {
+        customOpt.selected = true;
+      }
+      protonField.append(protonSelect); panel.append(protonField);
+
+      const protonPathInput = input('Proton path', config.protonPath, value => { config.protonPath = value; }, '/path/to/GE-Proton');
+      protonPathInput.hidden = protonSelect.value !== 'custom';
+      panel.append(protonPathInput);
+
+      protonSelect.addEventListener('change', () => {
+        if (protonSelect.value === 'custom') {
+          protonPathInput.hidden = false;
+        } else {
+          protonPathInput.hidden = true;
+          config.protonPath = protonSelect.value;
+          protonPathInput.querySelector('input').value = config.protonPath;
+        }
+      });
+
       panel.append(input('UMU launcher', config.umuPath, value => { config.umuPath = value; }, 'umu-run'));
       panel.append(input('Wine prefix', config.winePrefix, value => { config.winePrefix = value; }, '/path/to/prefix'));
     }
     panel.append(input('Arguments', config.arguments, value => { config.arguments = value; }, '-windowed'));
+
+    // Launch Environment & Performance Toggles
+    const envSection = document.createElement('details'); envSection.className = 'advanced-proton';
+    const envSummary = document.createElement('summary'); envSummary.textContent = 'Launch Environment & Performance Toggles'; envSection.append(envSummary);
+
+    const togglesGrid = document.createElement('div'); togglesGrid.className = 'toggles-grid';
+    const addToggle = (key, labelText) => {
+      const label = document.createElement('label'); label.className = 'toggle-label';
+      const box = document.createElement('input'); box.type = 'checkbox'; box.checked = Boolean(config[key]);
+      box.addEventListener('change', () => { config[key] = box.checked; });
+      label.append(box, labelText); togglesGrid.append(label);
+    };
+
+    addToggle('gameMode', 'GameMode');
+    addToggle('mangoHud', 'MangoHud');
+    addToggle('useWineD3D', 'WineD3D');
+    addToggle('noEsync', 'No Esync');
+    addToggle('noFsync', 'No Fsync');
+    addToggle('enableFsr', 'Wine FSR Upscaler');
+    addToggle('enableRdnaRayTracing', 'AMD RDNA Ray Tracing (DXR)');
+    addToggle('hideNvidiaGpu', 'Hide NVIDIA GPU');
+    addToggle('enableNvapi', 'NVIDIA NVAPI / DLSS');
+    addToggle('enableMesaGlThread', 'Mesa OpenGL Threading');
+    addToggle('largeAddressAware', 'Force 4GB LAA (32-bit patch)');
+    addToggle('dxvkAsync', 'DXVK Async Shader Cache');
+    envSection.append(togglesGrid);
+
+    // AMD Vulkan Driver Field
+    const amdDriverField = document.createElement('label'); amdDriverField.className = 'field';
+    amdDriverField.innerHTML = '<span>AMD Vulkan Driver (AMD_VULKAN_ICD)</span>';
+    const amdDriverSelect = document.createElement('select');
+    const amdOptions = [
+      { value: 'default', label: 'Default (System Driver)' },
+      { value: 'radv', label: 'Mesa RADV (Open Source - Recommended)' },
+      { value: 'amdvlk', label: 'AMDVLK (Official Open Source)' },
+      { value: 'pro', label: 'AMDGPU-PRO (Proprietary Driver)' }
+    ];
+    for (const opt of amdOptions) {
+      const item = document.createElement('option'); item.value = opt.value; item.textContent = opt.label;
+      if ((config.amdVulkanDriver || 'default') === opt.value) item.selected = true;
+      amdDriverSelect.append(item);
+    }
+    amdDriverSelect.addEventListener('change', () => { config.amdVulkanDriver = amdDriverSelect.value; });
+    amdDriverField.append(amdDriverSelect); envSection.append(amdDriverField);
+
+    // FSR Strength Field
+    const fsrField = document.createElement('label'); fsrField.className = 'field';
+    fsrField.innerHTML = '<span>FSR Sharpening Strength (WINE_FULLSCREEN_FSR_STRENGTH)</span>';
+    const fsrSelect = document.createElement('select');
+    const fsrOptions = [
+      { value: '0', label: '0 — Ultra Sharp' },
+      { value: '1', label: '1 — High Sharpness' },
+      { value: '2', label: '2 — Balanced (Default)' },
+      { value: '3', label: '3 — Medium' },
+      { value: '4', label: '4 — Soft' },
+      { value: '5', label: '5 — Softest' }
+    ];
+    for (const opt of fsrOptions) {
+      const item = document.createElement('option'); item.value = opt.value; item.textContent = opt.label;
+      if (String(config.fsrStrength ?? '2') === opt.value) item.selected = true;
+      fsrSelect.append(item);
+    }
+    fsrSelect.addEventListener('change', () => { config.fsrStrength = fsrSelect.value; });
+    fsrField.append(fsrSelect); envSection.append(fsrField);
+
+    envSection.append(input('DXVK HUD (optional)', config.dxvkHud || '', value => { config.dxvkHud = value; }, 'compiler,fps'));
+    envSection.append(input('UMU Store Context', config.store || '', value => { config.store = value; }, 'steam / gog / epic'));
+    envSection.append(input('UMU Game ID Override', config.umuGameId || '', value => { config.umuGameId = value; }, 'steam-730 or umu-12345'));
+
+    panel.append(envSection);
   }
+
   const actions = document.createElement('div'); actions.className = 'launcher-actions';
   const save = document.createElement('button'); save.textContent = 'Save settings';
   save.addEventListener('click', async () => {
@@ -369,14 +582,173 @@ function renderLauncher(game, config) {
   const preview = document.createElement('button'); preview.textContent = 'Preview command';
   preview.addEventListener('click', async () => { try { $('#status').textContent = (await window.libraryApi.previewLaunch(game, config)).command; } catch (error) { $('#status').textContent = error.message; } });
   const launch = document.createElement('button'); launch.className = 'primary'; launch.textContent = 'Launch';
-  launch.addEventListener('click', async () => { try { $('#status').textContent = `Launch requested: ${(await window.libraryApi.launch(game, config)).command}`; } catch (error) { $('#status').textContent = error.message; } });
-  actions.append(save, preview, launch); panel.append(actions);
+  launch.addEventListener('click', async () => {
+    try {
+      expandDebugDrawer();
+      $('#status').textContent = `Launching ${game.name}...`;
+      await window.libraryApi.launch(game, config);
+    } catch (error) { $('#status').textContent = error.message; }
+  });
+  actions.append(save, preview);
+  if (config.runner === 'wine' || config.runner === 'proton') {
+    const addonContainer = document.createElement('div'); addonContainer.className = 'addon-installer-row';
+    addonContainer.style.display = 'inline-flex'; addonContainer.style.gap = '8px'; addonContainer.style.alignItems = 'center';
+
+    const addonSelect = document.createElement('select');
+    const addonOptions = [
+      { value: 'vc_redist', label: 'Visual C++ 2015-2022' },
+      { value: 'directx', label: 'DirectX Runtimes (Jun2010)' },
+      { value: 'dotnet', label: 'Microsoft .NET Desktop 8' },
+      { value: 'openal', label: 'OpenAL Audio Installer' }
+    ];
+    for (const opt of addonOptions) {
+      const item = document.createElement('option'); item.value = opt.value; item.textContent = opt.label;
+      addonSelect.append(item);
+    }
+
+    const installAddonBtn = document.createElement('button');
+    installAddonBtn.textContent = 'Install Addon';
+    installAddonBtn.title = 'Downloads and installs selected Windows runtime into this game prefix';
+    installAddonBtn.addEventListener('click', async () => {
+      const selectedKey = addonSelect.value;
+      const selectedLabel = addonSelect.options[addonSelect.selectedIndex].text;
+      installAddonBtn.disabled = true;
+      try {
+        expandDebugDrawer();
+        $('#status').textContent = `Installing ${selectedLabel} into prefix...`;
+        await window.libraryApi.installRuntimeAddon(game, config, selectedKey);
+        $('#status').textContent = `${selectedLabel} installation finished.`;
+      } catch (error) {
+        $('#status').textContent = error.message || `Failed to install ${selectedLabel}.`;
+      } finally {
+        installAddonBtn.disabled = false;
+      }
+    });
+
+    addonContainer.append(addonSelect, installAddonBtn);
+    actions.append(addonContainer);
+  }
+  actions.append(launch); panel.append(actions);
 }
+
+// Debug Terminal drawer functions
+function expandDebugDrawer() {
+  $('#debug-drawer')?.classList.remove('collapsed');
+  $('#debug-drawer')?.classList.add('expanded');
+  const toggleBtn = $('#toggle-debug-drawer');
+  if (toggleBtn) toggleBtn.textContent = 'Collapse Console';
+}
+
+function collapseDebugDrawer() {
+  $('#debug-drawer')?.classList.remove('expanded');
+  $('#debug-drawer')?.classList.add('collapsed');
+  const toggleBtn = $('#toggle-debug-drawer');
+  if (toggleBtn) toggleBtn.textContent = 'Expand Log Terminal';
+}
+
+$('#toggle-debug-drawer')?.addEventListener('click', () => {
+  if ($('#debug-drawer')?.classList.contains('expanded')) collapseDebugDrawer();
+  else expandDebugDrawer();
+});
+
+$('#clear-debug-logs')?.addEventListener('click', () => {
+  $('#debug-terminal-logs').replaceChildren();
+});
+
+function appendDebugLog(logObj) {
+  const terminal = $('#debug-terminal-logs');
+  if (!terminal) return;
+  const span = document.createElement('span');
+  span.className = `log-${logObj.type || 'stdout'}`;
+  span.textContent = logObj.text;
+  terminal.append(span);
+  const drawerBody = $('.debug-drawer-body');
+  if (drawerBody) drawerBody.scrollTop = drawerBody.scrollHeight;
+}
+
+function updateLaunchStatus(statusObj) {
+  const badge = $('#launch-status-badge');
+  if (!badge) return;
+  badge.className = `badge ${statusObj.state}`;
+  badge.textContent = statusObj.state.toUpperCase();
+  if (statusObj.state === 'starting' || statusObj.state === 'running') {
+    expandDebugDrawer();
+  }
+}
+
+if (window.libraryApi?.onLaunchLog) window.libraryApi.onLaunchLog(appendDebugLog);
+if (window.libraryApi?.onLaunchStatus) window.libraryApi.onLaunchStatus(updateLaunchStatus);
+
+// Steam Store Search Modal logic
+function openSteamSearchModal(game) {
+  activeGameForSearch = game;
+  $('#steam-search-input').value = game.name;
+  $('#steam-search-results').replaceChildren();
+  $('#steam-search-status').textContent = '';
+  $('#steam-search-modal').hidden = false;
+  void performSteamSearch();
+}
+
+function closeSteamSearchModal() {
+  $('#steam-search-modal').hidden = true;
+  activeGameForSearch = null;
+}
+
+$('#close-steam-search')?.addEventListener('click', closeSteamSearchModal);
+$('#steam-search-modal')?.addEventListener('click', (e) => {
+  if (e.target === $('#steam-search-modal')) closeSteamSearchModal();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && $('#steam-search-modal') && !$('#steam-search-modal').hidden) {
+    closeSteamSearchModal();
+  }
+});
+
+async function performSteamSearch() {
+  const query = $('#steam-search-input').value.trim();
+  if (!query) return;
+  $('#steam-search-status').textContent = 'Searching Steam Store...';
+  $('#steam-search-results').replaceChildren();
+  try {
+    const results = await window.libraryApi.searchSteamStore(query);
+    if (!results.length) {
+      $('#steam-search-status').textContent = 'No matching Steam Store items found.';
+      return;
+    }
+    $('#steam-search-status').textContent = `Found ${results.length} results:`;
+    for (const item of results) {
+      const row = document.createElement('div'); row.className = 'search-result-item';
+      const img = document.createElement('img'); img.src = item.tiny_image; img.alt = '';
+      const title = document.createElement('span'); title.className = 'item-title'; title.textContent = item.name;
+      const appId = document.createElement('span'); appId.className = 'item-id'; appId.textContent = `ID: ${item.id}`;
+      row.append(img, title, appId);
+      row.addEventListener('click', async () => {
+        if (!activeGameForSearch) return;
+        $('#steam-search-status').textContent = `Applying App ID ${item.id} to ${activeGameForSearch.name}...`;
+        try {
+          await window.libraryApi.applyStoreAppId(activeGameForSearch, item.id);
+          closeSteamSearchModal();
+          await load();
+          $('#status').textContent = `Applied App ID ${item.id} to ${activeGameForSearch.name}.`;
+        } catch (err) {
+          $('#steam-search-status').textContent = err.message || 'Error applying App ID.';
+        }
+      });
+      $('#steam-search-results').append(row);
+    }
+  } catch (err) {
+    $('#steam-search-status').textContent = err.message || 'Error searching Steam Store.';
+  }
+}
+
+$('#steam-search-btn')?.addEventListener('click', performSteamSearch);
+$('#steam-search-input')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') void performSteamSearch(); });
 
 async function load() {
   $('#status').textContent = 'Scanning installed libraries…';
   try {
     libraryData = await window.libraryApi.load();
+    try { if (window.libraryApi.discoverCompatibilityTools) discoveredProtonTools = await window.libraryApi.discoverCompatibilityTools(); } catch {}
     renderGlobalProtonSettings();
     renderLibrary();
     $('#status').textContent = 'Library scan complete.';

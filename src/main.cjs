@@ -324,16 +324,24 @@ async function scanFolder(root) {
 
 async function findSuggestedExecutable(root) {
   const queue = [{ directory: root, depth: 0 }];
+  const executables = [];
   while (queue.length) {
     const { directory, depth } = queue.shift(); let entries = [];
     try { entries = await fs.readdir(directory, { withFileTypes: true }); } catch { continue; }
     for (const entry of entries.slice(0, 250)) {
       const candidate = path.join(directory, entry.name);
-      if (entry.isFile() && /\.exe$/i.test(entry.name)) return candidate;
-      if (entry.isDirectory() && depth < 3 && !entry.name.startsWith('.')) queue.push({ directory: candidate, depth: depth + 1 });
+      if (entry.isFile() && /\.exe$/i.test(entry.name)) {
+        if (!/unins|installer|crash|redist|dotnet|setup/i.test(entry.name)) {
+          executables.push(candidate);
+        }
+      }
+      if (entry.isDirectory() && depth < 4 && !entry.name.startsWith('.')) queue.push({ directory: candidate, depth: depth + 1 });
     }
   }
-  return '';
+  if (!executables.length) return '';
+  const shipping = executables.find(e => /Win64-Shipping\.exe$/i.test(e) || /Binaries\/Win64/i.test(e));
+  if (shipping) return shipping;
+  return executables[0];
 }
 
 function plainText(value) {
@@ -361,11 +369,76 @@ async function fetchJson(url) {
   finally { clearTimeout(timeout); }
 }
 
+async function fetchProtonDbSummary(appId) {
+  if (!/^\d+$/.test(String(appId))) return null;
+  const data = await fetchJson(`https://www.protondb.com/api/v1/reports/summaries/${appId}.json`);
+  if (!data || typeof data !== 'object') return null;
+  return {
+    tier: typeof data.tier === 'string' ? data.tier : 'pending',
+    trendingTier: typeof data.trendingTier === 'string' ? data.trendingTier : data.tier || 'pending',
+    confidence: typeof data.confidence === 'string' ? data.confidence : '',
+    score: typeof data.score === 'number' ? data.score : null,
+    total: typeof data.total === 'number' ? data.total : 0
+  };
+}
+
 async function storeMetadata(appId) {
   if (!/^\d+$/.test(String(appId))) return null;
-  const payload = await fetchJson(`https://store.steampowered.com/api/appdetails?appids=${encodeURIComponent(appId)}&l=english&cc=US`);
+  const [payload, protonDb] = await Promise.all([
+    fetchJson(`https://store.steampowered.com/api/appdetails?appids=${encodeURIComponent(appId)}&l=english&cc=US`),
+    fetchProtonDbSummary(appId)
+  ]);
   const result = payload?.[appId];
-  return result?.success && result.data ? metadataFromStore(appId, result.data) : null;
+  if (!result?.success || !result.data) return null;
+  const meta = metadataFromStore(appId, result.data);
+  if (protonDb) meta.protonDb = protonDb;
+  return meta;
+}
+
+async function searchSteamStoreApi(query) {
+  if (!query || typeof query !== 'string' || !query.trim()) return [];
+  const payload = await fetchJson(`https://store.steampowered.com/api/storesearch/?term=${encodeURIComponent(query.trim())}&l=english&cc=US`);
+  if (!payload?.items || !Array.isArray(payload.items)) return [];
+  return payload.items.slice(0, 15).map((item) => ({
+    id: String(item.id),
+    name: item.name,
+    tiny_image: item.tiny_image || `https://cdn.akamai.steamstatic.com/steam/apps/${item.id}/header.jpg`
+  }));
+}
+
+async function discoverCompatibilityTools() {
+  if (process.platform !== 'linux') return [];
+  const home = app.getPath('home');
+  const candidateRoots = [
+    path.join(home, '.local', 'share', 'Steam', 'compatibilitytools.d'),
+    path.join(home, '.steam', 'steam', 'compatibilitytools.d'),
+    path.join(home, '.var', 'app', 'com.valvesoftware.Steam', 'data', 'Steam', 'compatibilitytools.d'),
+    '/usr/share/steam/compatibilitytools.d'
+  ];
+  const tools = [];
+  const seenPaths = new Set();
+  for (const root of candidateRoots) {
+    if (!(await directoryExists(root))) continue;
+    try {
+      const entries = await fs.readdir(root, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+        const toolDir = path.join(root, entry.name);
+        if (seenPaths.has(toolDir)) continue;
+        seenPaths.add(toolDir);
+        const protonExec = path.join(toolDir, 'proton');
+        try {
+          await fs.access(protonExec);
+          tools.push({
+            name: entry.name,
+            path: toolDir,
+            isGe: /GE-Proton/i.test(entry.name)
+          });
+        } catch {}
+      }
+    } catch {}
+  }
+  return tools;
 }
 
 async function findStoreAppId(title) {
@@ -441,6 +514,8 @@ async function loadLibrary() {
   const attachCompatibility = (game) => {
     const metadata = gameMetadata[game.id] || {};
     const steamAppId = game.appId || metadata.storeAppId || game.sharedSteamAppId;
+    const protonDbTierToRating = { platinum: 5, gold: 4, silver: 3, bronze: 2, borked: 1 };
+    const defaultRating = metadata.protonDb?.tier ? (protonDbTierToRating[metadata.protonDb.tier.toLowerCase()] || 0) : 0;
     return {
       ...game,
       ...metadata,
@@ -451,9 +526,10 @@ async function loadLibrary() {
       suggestedArguments: game.sharedArguments || [],
       protonCompatibility: Number.isInteger(gameSettings[game.id]?.protonCompatibility)
         ? gameSettings[game.id].protonCompatibility
-        : 0,
+        : defaultRating,
       runsOn: gameSettings[game.id]?.runsOn || game.sharedRunsOn || { windows: true, linux: true },
       defaultCompatDataPath: gameCompatDataPath(globalProton.compatDataRoot, game.id),
+      protonDb: metadata.protonDb || null,
       protonDbUrl: process.platform === 'linux' && /^\d+$/.test(String(steamAppId || ''))
         ? `https://www.protondb.com/app/${steamAppId}`
         : undefined
@@ -844,6 +920,128 @@ ipcMain.handle('settings:install-ge-proton', async () => {
   return { ...installed, settings: protonSettings(settings) };
 });
 
+async function diagnoseSystemHealth() {
+  const isLinux = process.platform === 'linux';
+  const results = {
+    platform: process.platform,
+    vulkan64: { status: 'MISSING', details: 'No 64-bit Vulkan ICD manifest found' },
+    vulkan32: { status: 'MISSING', details: 'No 32-bit Vulkan ICD manifest found (Required for 32-bit Windows games)' },
+    wine: { status: 'MISSING', details: 'Wine binary not found in PATH' },
+    umu: { status: 'MISSING', details: 'umu-run launcher binary not found in PATH' },
+    geProton: { status: 'MISSING', details: 'No GE-Proton installation detected' },
+    gamemode: { status: 'WARNING', details: 'GameMode (gamemoderun) not installed (Optional performance tool)' },
+    mangohud: { status: 'WARNING', details: 'MangoHud overlay not installed (Optional performance tool)' },
+    unzip: { status: 'WARNING', details: 'unzip utility missing (Required for archive extractions)' },
+    ntlmAuth: { status: 'WARNING', details: 'ntlm_auth missing (Install winbind package for EOS / Epic Online Services support)' },
+    ulimit: { status: 'PASS', details: 'File descriptor limit OK' }
+  };
+
+  if (!isLinux) return results;
+
+  const icdSearchPaths = [
+    '/usr/share/vulkan/icd.d',
+    '/etc/vulkan/icd.d',
+    path.join(os.homedir(), '.local/share/vulkan/icd.d')
+  ];
+
+  const foundVulkan64 = [];
+  const foundVulkan32 = [];
+
+  for (const icdPath of icdSearchPaths) {
+    try {
+      const files = await fs.readdir(icdPath);
+      for (const file of files) {
+        if (!file.endsWith('.json')) continue;
+        const fullPath = path.join(icdPath, file);
+        try {
+          const content = await fs.readFile(fullPath, 'utf8');
+          const parsed = JSON.parse(content);
+          const libPath = parsed?.ICD?.library_path || file;
+          if (file.includes('i686') || file.includes('x86_32') || file.includes('lib32') || libPath.includes('32')) {
+            foundVulkan32.push(file);
+          } else {
+            foundVulkan64.push(file);
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+
+  if (foundVulkan64.length > 0) {
+    results.vulkan64 = { status: 'PASS', details: `Found 64-bit Vulkan ICDs: ${foundVulkan64.join(', ')}` };
+  }
+  if (foundVulkan32.length > 0) {
+    results.vulkan32 = { status: 'PASS', details: `Found 32-bit Vulkan ICDs: ${foundVulkan32.join(', ')}` };
+  } else {
+    results.vulkan32 = { status: 'WARNING', details: 'Missing 32-bit Vulkan drivers (Install lib32-vulkan-radeon or vulkan-radeon:i386 for 32-bit games)' };
+  }
+
+  const checkBinary = async (binaryName) => {
+    return new Promise((resolve) => {
+      const child = spawn('which', [binaryName], { stdio: 'ignore' });
+      child.once('exit', (code) => resolve(code === 0));
+      child.once('error', () => resolve(false));
+    });
+  };
+
+  if (await checkBinary('wine')) results.wine = { status: 'PASS', details: 'Wine binary found in PATH' };
+  if (await checkBinary('umu-run')) results.umu = { status: 'PASS', details: 'umu-run launcher binary found in PATH' };
+  if (await checkBinary('gamemoderun')) {
+    let hasLibGameMode = false;
+    try {
+      await new Promise((resolve) => {
+        const child = spawn('sh', ['-c', 'ldconfig -p | grep libgamemode'], { stdio: ['ignore', 'pipe', 'ignore'] });
+        let out = '';
+        child.stdout.on('data', c => { out += c.toString('utf8'); });
+        child.once('exit', () => {
+          hasLibGameMode = out.includes('libgamemode');
+          resolve();
+        });
+        child.once('error', resolve);
+      });
+    } catch {}
+    if (hasLibGameMode) {
+      results.gamemode = { status: 'PASS', details: 'GameMode (gamemoderun and libgamemode.so) found' };
+    } else {
+      results.gamemode = { status: 'WARNING', details: 'gamemoderun found, but libgamemode.so is missing (Install package gamemode)' };
+    }
+  }
+  if (await checkBinary('mangohud')) results.mangohud = { status: 'PASS', details: 'MangoHud overlay found' };
+  if (await checkBinary('unzip')) results.unzip = { status: 'PASS', details: 'unzip utility found' };
+  if (await checkBinary('ntlm_auth')) results.ntlmAuth = { status: 'PASS', details: 'ntlm_auth (winbind) found' };
+
+  try {
+    const protonTools = await discoverCompatibilityTools();
+    if (protonTools && protonTools.length > 0) {
+      results.geProton = { status: 'PASS', details: `Found ${protonTools.length} compatibility tool(s): ${protonTools.map(t => t.name).join(', ')}` };
+    }
+  } catch {}
+
+  try {
+    await new Promise((resolve) => {
+      const child = spawn('sh', ['-c', 'ulimit -n'], { stdio: ['ignore', 'pipe', 'ignore'] });
+      let output = '';
+      child.stdout.on('data', chunk => { output += chunk.toString('utf8'); });
+      child.once('exit', () => {
+        const num = Number.parseInt(output.trim(), 10);
+        if (num && num < 524288) {
+          results.ulimit = { status: 'WARNING', details: `File descriptor limit is ${num} (>= 524288 recommended for Esync stability)` };
+        } else if (num) {
+          results.ulimit = { status: 'PASS', details: `File descriptor limit is ${num}` };
+        }
+        resolve();
+      });
+      child.once('error', resolve);
+    });
+  } catch {}
+
+  return results;
+}
+
+ipcMain.handle('system:diagnose-health', async () => diagnoseSystemHealth());
+ipcMain.handle('settings:discover-proton-tools', async () => discoverCompatibilityTools());
+ipcMain.handle('library:search-steam-store', async (_event, query) => searchSteamStoreApi(query));
+
 ipcMain.handle('launcher:choose-executable', async () => {
   const result = await dialog.showOpenDialog({
     title: 'Choose a game executable',
@@ -875,14 +1073,37 @@ ipcMain.handle('launcher:save', async (_event, game, configuration) => {
     umuPath: typeof configuration.umuPath === 'string' ? configuration.umuPath : 'umu-run',
     arguments: typeof configuration.arguments === 'string' ? configuration.arguments : '',
     protonCompatibility,
-    runsOn
+    runsOn,
+    gameMode: Boolean(configuration.gameMode),
+    mangoHud: Boolean(configuration.mangoHud),
+    useWineD3D: Boolean(configuration.useWineD3D),
+    noEsync: Boolean(configuration.noEsync),
+    noFsync: Boolean(configuration.noFsync),
+    dxvkHud: typeof configuration.dxvkHud === 'string' ? configuration.dxvkHud : '',
+    store: typeof configuration.store === 'string' ? configuration.store : '',
+    umuGameId: typeof configuration.umuGameId === 'string' ? configuration.umuGameId : ''
   };
   await saveGameSettings(settings);
   await writeGameManifest(game, settings[gameId]);
   return settings[gameId];
 });
 
-function splitArguments(value) { return value.trim() ? value.trim().split(/\s+/) : []; }
+function splitArguments(value) {
+  if (!value || typeof value !== 'string' || !value.trim()) return { args: [], envInjected: {} };
+  const rawTokens = value.trim().split(/\s+/);
+  const args = [];
+  const envInjected = {};
+  for (const token of rawTokens) {
+    const unquoted = token.replace(/^["']|["']$/g, '');
+    if (/^[A-Z0-9_]+=[^\s]+$/.test(unquoted)) {
+      const parts = unquoted.split('=');
+      envInjected[parts[0]] = parts.slice(1).join('=');
+    } else {
+      args.push(token);
+    }
+  }
+  return { args, envInjected };
+}
 
 function launchSpec(game, configuration) {
   const config = configuration || (game.source === 'Steam' ? { runner: 'steam' } : null);
@@ -893,21 +1114,59 @@ function launchSpec(game, configuration) {
     return { command: 'xdg-open', args: [`steam://rungameid/${game.appId}`], env: {} };
   }
   if (!config.executable) throw new Error('Choose a game executable first.');
-  const args = splitArguments(config.arguments);
+  const { args, envInjected } = splitArguments(config.arguments);
   const cwd = config.workingDirectory || path.dirname(config.executable);
-  if (config.runner === 'native' && process.platform === 'win32') return { openPath: config.executable, env: {} };
-  if (config.runner === 'native') return { command: config.executable, args, env: {}, cwd };
-  if (config.runner === 'wine') return { command: config.wineBinary || 'wine', args: [config.executable, ...args], env: config.winePrefix ? { WINEPREFIX: config.winePrefix } : {}, cwd };
-  if (!config.protonPath) throw new Error('Choose a GE-Proton directory before launching with Proton.');
-  if (!config.winePrefix) throw new Error('Choose a Wine prefix before launching with Proton.');
-  const env = {
-    WINEPREFIX: config.winePrefix,
-    PROTONPATH: config.protonPath,
-    GAMEID: game.umuGameId || 'umu-default',
-    STORE: game.store || 'none',
-    STEAM_COMPAT_LIBRARY_PATHS: game.path
-  };
-  return { command: config.umuPath || 'umu-run', args: [config.executable, ...args], env, cwd };
+  if (config.runner === 'native' && process.platform === 'win32') {
+    if (!args.length && !config.workingDirectory) return { openPath: config.executable, env: {} };
+    return { command: config.executable, args, env: {}, cwd };
+  }
+
+  let command = config.executable;
+  let commandArgs = args;
+  const env = { ...envInjected };
+
+  if (config.mangoHud) env.MANGOHUD = '1';
+  if (config.useWineD3D) env.PROTON_USE_WINED3D = '1';
+  if (config.noEsync) env.PROTON_NO_ESYNC = '1';
+  if (config.noFsync) env.PROTON_NO_FSYNC = '1';
+  if (config.dxvkHud) env.DXVK_HUD = config.dxvkHud;
+  if (config.amdVulkanDriver && config.amdVulkanDriver !== 'default') env.AMD_VULKAN_ICD = config.amdVulkanDriver;
+  if (config.enableFsr) env.WINE_FULLSCREEN_FSR = '1';
+  if (config.fsrStrength !== undefined && config.fsrStrength !== '') env.WINE_FULLSCREEN_FSR_STRENGTH = String(config.fsrStrength);
+  if (config.enableRdnaRayTracing) {
+    env.RADV_PERFTEST = env.RADV_PERFTEST ? `${env.RADV_PERFTEST},rt` : 'rt';
+    env.VKD3D_CONFIG = env.VKD3D_CONFIG ? `${env.VKD3D_CONFIG},dxr,dxr11` : 'dxr,dxr11';
+  }
+  if (config.hideNvidiaGpu) env.PROTON_HIDE_NVIDIA_GPU = '1';
+  if (config.enableNvapi) env.PROTON_ENABLE_NVAPI = '1';
+  if (config.enableMesaGlThread) env.MESA_GL_THREAD = 'true';
+  if (config.largeAddressAware) env.PROTON_FORCE_LARGE_ADDRESS_AWARE = '1';
+  if (config.dxvkAsync) env.DXVK_ASYNC = '1';
+
+  if (config.runner === 'wine') {
+    command = config.wineBinary || 'wine';
+    commandArgs = [config.executable, ...args];
+    if (config.winePrefix) env.WINEPREFIX = config.winePrefix;
+  } else if (config.runner === 'proton') {
+    if (!config.protonPath) throw new Error('Choose a GE-Proton directory before launching with Proton.');
+    if (!config.winePrefix) throw new Error('Choose a Wine prefix before launching with Proton.');
+    env.WINEPREFIX = config.winePrefix;
+    env.PROTONPATH = config.protonPath;
+    const appIdStr = game.appId || game.storeAppId || '';
+    env.GAMEID = config.umuGameId || (appIdStr ? `steam-${appIdStr}` : 'umu-default');
+    env.STORE = config.store || (game.source === 'Steam' || appIdStr || config.umuGameId ? 'steam' : 'none');
+    const parentLibDir = path.dirname(game.path);
+    env.STEAM_COMPAT_LIBRARY_PATHS = `${parentLibDir}:${game.path}`;
+    command = config.umuPath || 'umu-run';
+    commandArgs = [config.executable, ...args];
+  }
+
+  if (config.gameMode) {
+    commandArgs = [command, ...commandArgs];
+    command = 'gamemoderun';
+  }
+
+  return { command, args: commandArgs, env, cwd };
 }
 
 function printableSpec(spec) {
@@ -919,24 +1178,205 @@ function printableSpec(spec) {
 
 ipcMain.handle('launcher:preview', async (_event, game, configuration) => ({ command: printableSpec(launchSpec(game, configuration)) }));
 
+async function installRuntimeAddon(game, configuration, addonKey) {
+  if (process.platform !== 'linux') throw new Error('Runtime addon installer is for Linux Wine/Proton setups.');
+  const config = configuration || {};
+  if (!config.winePrefix) throw new Error('Specify a Wine prefix before installing runtime addons.');
+
+  const cacheDir = path.join(SETTINGS_DIR, 'cache');
+  await fs.mkdir(cacheDir, { recursive: true });
+  await fs.mkdir(config.winePrefix, { recursive: true });
+
+  const broadcastLog = (logObj) => {
+    BrowserWindow.getAllWindows().forEach((win) => {
+      if (!win.isDestroyed()) win.webContents.send('launcher:log', logObj);
+    });
+  };
+
+  const addons = {
+    vc_redist: {
+      name: 'Visual C++ 2015-2022 Redistributable (x64)',
+      filename: 'vc_redist.x64.exe',
+      url: 'https://aka.ms/vs/17/release/vc_redist.x64.exe',
+      args: '/quiet /norestart'
+    },
+    directx: {
+      name: 'DirectX End-User Web Runtimes',
+      filename: 'dxwebsetup.exe',
+      url: 'https://download.microsoft.com/download/1/7/1/1718FBA5-5F5B-4192-A022-88B989C9A13F/dxwebsetup.exe',
+      args: '/q'
+    },
+    dotnet: {
+      name: 'Microsoft .NET Desktop Runtime 8.0 (x64)',
+      filename: 'windowsdesktop-runtime-8.0-win-x64.exe',
+      url: 'https://download.visualstudio.microsoft.com/download/pr/499b9cfd-cfc5-4fb5-90df-0b4457e53f1c/70db6422d7d56bb5fcfb95e3dd9c585c/windowsdesktop-runtime-8.0.10-win-x64.exe',
+      args: '/quiet /norestart'
+    },
+    openal: {
+      name: 'OpenAL Audio Installer',
+      filename: 'oalinst.exe',
+      url: 'https://openal.org/downloads/oalinst.zip',
+      isZip: true,
+      args: '/s'
+    }
+  };
+
+  const addon = addons[addonKey || 'vc_redist'];
+  if (!addon) throw new Error(`Unknown runtime addon: ${addonKey}`);
+
+  broadcastLog({ type: 'system', text: `[${new Date().toLocaleTimeString()}] ${addon.name} installer initiated for ${game.name}.\n` });
+
+  const targetExePath = path.join(cacheDir, addon.filename);
+
+  try {
+    await fs.access(targetExePath);
+    broadcastLog({ type: 'system', text: `[${new Date().toLocaleTimeString()}] Using cached ${addon.filename} installer.\n` });
+  } catch {
+    broadcastLog({ type: 'system', text: `[${new Date().toLocaleTimeString()}] Downloading ${addon.name}...\n` });
+    if (addon.isZip) {
+      const zipPath = path.join(cacheDir, 'oalinst.zip');
+      await downloadFile(addon.url, zipPath);
+      broadcastLog({ type: 'system', text: `[${new Date().toLocaleTimeString()}] Extracting ${addon.filename} from archive...\n` });
+      await runCommand('unzip', ['-o', zipPath, '-d', cacheDir]);
+    } else {
+      await downloadFile(addon.url, targetExePath);
+    }
+    broadcastLog({ type: 'system', text: `[${new Date().toLocaleTimeString()}] Download complete.\n` });
+  }
+
+  const installerConfig = {
+    ...config,
+    executable: targetExePath,
+    arguments: addon.args,
+    workingDirectory: cacheDir
+  };
+
+  const spec = launchSpec(game, installerConfig);
+  const printable = printableSpec(spec);
+  broadcastLog({ type: 'system', text: `[${new Date().toLocaleTimeString()}] Running ${addon.name} installer in prefix...\nCommand: ${printable}\n` });
+
+  return new Promise((resolve, reject) => {
+    try {
+      const child = spawn(spec.command, spec.args, {
+        cwd: spec.cwd,
+        env: { ...process.env, ...spec.env },
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+
+      child.stdout.on('data', (chunk) => {
+        broadcastLog({ type: 'stdout', text: chunk.toString('utf8') });
+      });
+
+      child.stderr.on('data', (chunk) => {
+        broadcastLog({ type: 'stderr', text: chunk.toString('utf8') });
+      });
+
+      child.once('error', (err) => {
+        broadcastLog({ type: 'error', text: `[RUNTIME INSTALL ERROR] ${err.message}\n` });
+        reject(err);
+      });
+
+      child.once('exit', (code) => {
+        if (code === 0 || code === 3010) {
+          broadcastLog({ type: 'system', text: `[${new Date().toLocaleTimeString()}] ${addon.name} installed successfully into prefix!\n` });
+          resolve({ success: true, code });
+        } else {
+          broadcastLog({ type: 'error', text: `[RUNTIME INSTALL ERROR] Installer exited with code ${code}.\n` });
+          reject(new Error(`${addon.name} installer exited with code ${code}`));
+        }
+      });
+    } catch (err) {
+      broadcastLog({ type: 'error', text: `[RUNTIME INSTALL ERROR] ${err.message}\n` });
+      reject(err);
+    }
+  });
+}
+
+async function installVcRedist(game, configuration) {
+  return installRuntimeAddon(game, configuration, 'vc_redist');
+}
+
+ipcMain.handle('launcher:install-vc-redist', async (_event, game, configuration) => installVcRedist(game, configuration));
+ipcMain.handle('launcher:install-runtime-addon', async (_event, game, configuration, addonKey) => installRuntimeAddon(game, configuration, addonKey));
+
 ipcMain.handle('launcher:launch', async (_event, game, configuration) => {
   const spec = launchSpec(game, configuration);
+  const printable = printableSpec(spec);
+
+  const broadcastStatus = (statusObj) => {
+    BrowserWindow.getAllWindows().forEach((win) => {
+      if (!win.isDestroyed()) win.webContents.send('launcher:status', statusObj);
+    });
+  };
+
+  const broadcastLog = (logObj) => {
+    BrowserWindow.getAllWindows().forEach((win) => {
+      if (!win.isDestroyed()) win.webContents.send('launcher:log', logObj);
+    });
+  };
+
+  broadcastStatus({ state: 'starting', command: printable, gameName: game.name });
+  broadcastLog({ type: 'system', text: `[${new Date().toLocaleTimeString()}] Launching ${game.name}...\nCommand: ${printable}\nWorking Directory: ${spec.cwd || 'default'}\n` });
+
   if (spec.openExternal) {
     await shell.openExternal(spec.openExternal);
-    return { command: printableSpec(spec) };
+    broadcastStatus({ state: 'running', command: printable, gameName: game.name });
+    broadcastLog({ type: 'system', text: `[${new Date().toLocaleTimeString()}] External protocol launch requested.\n` });
+    return { command: printable };
   }
   if (spec.openPath) {
     const error = await shell.openPath(spec.openPath);
-    if (error) throw new Error(`Windows could not open ${spec.openPath}: ${error}`);
-    return { command: printableSpec(spec) };
+    if (error) {
+      broadcastStatus({ state: 'error', error: `Could not open path: ${error}` });
+      broadcastLog({ type: 'error', text: `[ERROR] ${error}\n` });
+      throw new Error(`Windows could not open ${spec.openPath}: ${error}`);
+    }
+    broadcastStatus({ state: 'running', command: printable, gameName: game.name });
+    return { command: printable };
   }
+
+  if (spec.env.WINEPREFIX) await fs.mkdir(spec.env.WINEPREFIX, { recursive: true });
   if (spec.env.STEAM_COMPAT_DATA_PATH) await fs.mkdir(spec.env.STEAM_COMPAT_DATA_PATH, { recursive: true });
-  await new Promise((resolve, reject) => {
-    const child = spawn(spec.command, spec.args, { cwd: spec.cwd, env: { ...process.env, ...spec.env }, detached: true, stdio: 'ignore' });
-    child.once('error', reject);
-    child.once('spawn', () => { child.unref(); resolve(); });
+
+  return new Promise((resolve, reject) => {
+    try {
+      const child = spawn(spec.command, spec.args, {
+        cwd: spec.cwd,
+        env: { ...process.env, ...spec.env },
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+
+      broadcastStatus({ state: 'running', pid: child.pid, command: printable, gameName: game.name });
+
+      child.stdout.on('data', (chunk) => {
+        broadcastLog({ type: 'stdout', text: chunk.toString('utf8') });
+      });
+
+      child.stderr.on('data', (chunk) => {
+        broadcastLog({ type: 'stderr', text: chunk.toString('utf8') });
+      });
+
+      child.once('error', (err) => {
+        broadcastStatus({ state: 'error', error: err.message });
+        broadcastLog({ type: 'error', text: `[LAUNCH ERROR] ${err.stack || err.message}\n` });
+        reject(err);
+      });
+
+      child.once('exit', (code, signal) => {
+        const statusText = code !== null ? `exited with code ${code}` : `terminated by signal ${signal}`;
+        broadcastStatus({ state: 'exited', exitCode: code, signal, command: printable, gameName: game.name });
+        broadcastLog({ type: 'system', text: `[${new Date().toLocaleTimeString()}] Process ${statusText}.\n` });
+      });
+
+      child.unref();
+      resolve({ command: printable, pid: child.pid });
+    } catch (err) {
+      broadcastStatus({ state: 'error', error: err.message });
+      broadcastLog({ type: 'error', text: `[LAUNCH ERROR] ${err.message}\n` });
+      reject(err);
+    }
   });
-  return { command: printableSpec(spec) };
 });
 
 app.whenReady().then(() => {

@@ -10,10 +10,23 @@ function card(game) {
     image.addEventListener('error', () => { cover.textContent = 'STEAM'; }); cover.append(image);
   } else cover.textContent = game.source === 'Steam' ? 'STEAM' : 'FOLDER';
   fragment.querySelector('h2').textContent = game.name;
+  if (game.protonDb?.tier) {
+    const badge = fragment.querySelector('.protondb-badge');
+    if (badge) {
+      const tier = String(game.protonDb.tier).toLowerCase();
+      badge.textContent = tier.toUpperCase();
+      badge.className = `protondb-badge ${tier}`;
+      badge.hidden = false;
+    }
+  }
   fragment.querySelector('.details').textContent = `${game.source} · ${game.available ? 'Available' : 'Missing files'}`;
   const compatibility = fragment.querySelector('.compatibility');
   if (library?.hostPlatform === 'win32') compatibility.remove();
-  else compatibility.textContent = `Proton support ${game.protonCompatibility || 0}/5`;
+  else {
+    compatibility.textContent = game.protonDb?.tier
+      ? `ProtonDB: ${game.protonDb.tier.toUpperCase()} (${game.protonDb.total || 0} reports)`
+      : `Proton support ${game.protonCompatibility || 0}/5`;
+  }
   fragment.querySelector('.genres').textContent = game.genres?.join(' · ') || '';
   fragment.querySelector('.summary').textContent = game.description || '';
   if (game.protonDbUrl) {
