@@ -6,6 +6,7 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
+const { performanceSettings, splitArguments, checksumAssetName } = require('./launcher-config.cjs');
 const { Readable, Transform } = require('stream');
 const { pipeline } = require('stream/promises');
 
@@ -156,9 +157,14 @@ async function sha512File(filename) {
 }
 
 async function downloadFile(url, destination) {
-  const response = await fetch(url, { headers: { 'User-Agent': 'XP Game Manager GE-Proton installer' } });
-  if (!response.ok || !response.body) throw new Error(`Download failed (${response.status}).`);
-  await pipeline(Readable.fromWeb(response.body), fsSync.createWriteStream(destination));
+  const temporary = `${destination}.${crypto.randomUUID()}.part`;
+  try {
+    const signal = AbortSignal.timeout(15 * 60 * 1000);
+    const response = await fetch(url, { signal, headers: { 'User-Agent': 'XP Game Manager installer' } });
+    if (!response.ok || !response.body) throw new Error(`Download failed (${response.status}).`);
+    await pipeline(Readable.fromWeb(response.body), fsSync.createWriteStream(temporary), { signal });
+    await fs.rename(temporary, destination);
+  } finally { await fs.rm(temporary, { force: true }); }
 }
 
 async function runCommand(command, args) {
@@ -169,21 +175,45 @@ async function runCommand(command, args) {
   });
 }
 
-async function installLatestGeProton() {
+let geInstallPromise;
+function installLatestGeProton(version = 'latest') {
+  if (geInstallPromise) throw new Error('A GE-Proton installation is already running.');
+  geInstallPromise = performGeProtonInstall(version).finally(() => { geInstallPromise = null; });
+  return geInstallPromise;
+}
+async function validateProtonDirectory(directory) {
+  if (!(await directoryExists(directory))) throw new Error('Proton must be a tool directory, not a script path.');
+  await fs.access(path.join(directory, 'proton'), fsSync.constants.X_OK);
+  await fs.access(path.join(directory, 'compatibilitytool.vdf'));
+}
+async function fetchGeRelease(version) {
+  if (version !== 'latest' && !/^GE-Proton[0-9]+-[0-9]+$/.test(version)) throw new Error('Invalid GE-Proton version.');
+  const endpoint = version === 'latest' ? 'latest' : `tags/${encodeURIComponent(version)}`;
+  const response = await fetch(`https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/${endpoint}`, { signal: AbortSignal.timeout(30000), headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'XP Game Manager' } });
+  if (!response.ok) throw new Error(`Could not fetch GE-Proton release (${response.status}).`);
+  return response.json();
+}
+async function listGeReleases() {
+  const response = await fetch('https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases?per_page=100', { signal: AbortSignal.timeout(30000), headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'XP Game Manager' } });
+  if (!response.ok) throw new Error(`Could not list GE-Proton versions (${response.status}).`);
+  const releases = await response.json();
+  return releases.filter(release => !release.draft && !release.prerelease && /^GE-Proton[0-9]+-[0-9]+$/.test(release.tag_name)).map(release => ({ version: release.tag_name }));
+}
+async function performGeProtonInstall(version) {
   if (process.platform !== 'linux') throw new Error('GE-Proton installation is only available on Linux.');
-  const releaseResponse = await fetch('https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest', { headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'XP Game Manager GE-Proton installer' } });
-  if (!releaseResponse.ok) throw new Error(`Could not fetch the latest GE-Proton release (${releaseResponse.status}).`);
-  const release = await releaseResponse.json();
+  const release = await fetchGeRelease(version);
   const arch = process.arch === 'arm64' ? 'aarch64' : process.arch === 'x64' ? 'x86_64' : '';
   if (!arch) throw new Error(`Unsupported architecture: ${process.arch}.`);
-  const archive = release.assets?.find((asset) => new RegExp(`-${arch}\\.tar\\.gz$`).test(asset.name));
-  if (!archive) throw new Error(`No ${arch} GE-Proton archive was found in the latest release.`);
-  const checksum = release.assets?.find((asset) => asset.name === `${archive.name}.sha512sum`);
-  if (!checksum) throw new Error('The latest GE-Proton release does not include a SHA-512 checksum for this archive.');
+  let archive = release.assets?.find((asset) => new RegExp(`-${arch}\\.tar\\.gz$`).test(asset.name));
+  const selectedArchive = archive || (arch === 'x86_64' ? release.assets?.find(asset => asset.name === `${release.tag_name}.tar.gz`) : null);
+  if (!selectedArchive) throw new Error(`No ${arch} GE-Proton archive was found for ${release.tag_name}.`);
+  archive = selectedArchive;
+  const checksum = release.assets?.find((asset) => asset.name === checksumAssetName(archive.name));
+  if (!checksum) throw new Error('This GE-Proton release does not include a SHA-512 checksum for this archive.');
   const installRoot = await geProtonInstallRoot();
   const releaseName = archive.name.replace(/\.tar\.gz$/, '');
   const installDirectory = path.join(installRoot, releaseName);
-  try { await fs.access(path.join(installDirectory, 'proton')); return { version: releaseName, protonPath: installDirectory, alreadyInstalled: true }; } catch {}
+  try { await validateProtonDirectory(installDirectory); return { version: releaseName, protonPath: installDirectory, alreadyInstalled: true }; } catch {}
   const tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'xp-game-manager-ge-'));
   try {
     const archivePath = path.join(tempDirectory, archive.name);
@@ -192,8 +222,17 @@ async function installLatestGeProton() {
     const expected = (await fs.readFile(checksumPath, 'utf8')).match(/^[a-fA-F0-9]{128}/m)?.[0]?.toLowerCase();
     if (!expected || await sha512File(archivePath) !== expected) throw new Error('GE-Proton checksum verification failed. Nothing was installed.');
     await fs.mkdir(installRoot, { recursive: true });
-    await runCommand('tar', ['-xzf', archivePath, '-C', installRoot]);
-    await fs.access(path.join(installDirectory, 'proton'));
+    const staging = await fs.mkdtemp(path.join(installRoot, '.xp-install-'));
+    try {
+      await runCommand('tar', ['-xzf', archivePath, '-C', staging, '--no-same-owner']);
+      const entries = await fs.readdir(staging, { withFileTypes: true });
+      const directories = entries.filter(entry => entry.isDirectory());
+      if (directories.length !== 1) throw new Error('Unexpected GE-Proton archive layout.');
+      const extracted = path.join(staging, directories[0].name);
+      await validateProtonDirectory(extracted);
+      if (await directoryExists(installDirectory)) throw new Error(`Incomplete installation at ${installDirectory}. Move it aside before reinstalling.`);
+      await fs.rename(extracted, installDirectory);
+    } finally { await fs.rm(staging, { recursive: true, force: true }); }
     return { version: releaseName, protonPath: installDirectory, alreadyInstalled: false };
   } finally {
     await fs.rm(tempDirectory, { recursive: true, force: true });
@@ -233,7 +272,7 @@ async function readGameManifest(gamePath) {
       sharedSteamAppId: /^\d+$/.test(String(manifest.steamAppId || '')) ? String(manifest.steamAppId) : '',
       sharedExecutable: executable,
       sharedWorkingDirectory: workingDirectory,
-      sharedArguments: Array.isArray(manifest.windows?.arguments) && manifest.windows.arguments.every((item) => typeof item === 'string') ? manifest.windows.arguments : [],
+      sharedArguments: Array.isArray(manifest.windows?.arguments) && manifest.windows.arguments.every((item) => typeof item === 'string') ? manifest.windows.arguments : (Array.isArray(manifest.windows?.arguments?.args) && manifest.windows.arguments.args.every(item => typeof item === 'string') ? manifest.windows.arguments.args : []),
       sharedRunsOn: manifest.runsOn && typeof manifest.runsOn === 'object' ? { windows: Boolean(manifest.runsOn.windows), linux: Boolean(manifest.runsOn.linux) } : null
     };
   } catch { return {}; }
@@ -249,7 +288,7 @@ async function writeGameManifest(game, configuration) {
     schemaVersion: 1,
     ...current,
     ...(current.steamAppId || game.storeAppId ? { steamAppId: current.steamAppId || game.storeAppId } : {}),
-    windows: { executable, workingDirectory, arguments: splitArguments(configuration.arguments || '') },
+    windows: { executable, workingDirectory, arguments: splitArguments(configuration.arguments || '').args },
     runsOn: configuration.runsOn && typeof configuration.runsOn === 'object' ? { windows: Boolean(configuration.runsOn.windows), linux: Boolean(configuration.runsOn.linux) } : { windows: true, linux: false }
   };
   await fs.writeFile(path.join(game.path, GAME_MANIFEST_FILE), `${JSON.stringify(manifest, null, 2)}\n`);
@@ -817,6 +856,13 @@ ipcMain.handle('library:load', loadLibrary);
 ipcMain.handle('library:discover-metadata', discoverGameMetadata);
 ipcMain.handle('library:apply-store-app-id', async (_event, game, appId) => applyStoreAppId(game, appId));
 
+ipcMain.handle('settings:choose-proton-directory', async () => {
+  const result = await dialog.showOpenDialog({ title: 'Choose a GE-Proton tool directory', properties: ['openDirectory'] });
+  if (result.canceled) return null;
+  await validateProtonDirectory(result.filePaths[0]);
+  return result.filePaths[0];
+});
+
 ipcMain.handle('library:choose-folder', async () => {
   const result = await dialog.showOpenDialog({ title: 'Choose a mounted game library folder', properties: ['openDirectory'] });
   return result.canceled ? null : result.filePaths[0];
@@ -911,8 +957,9 @@ ipcMain.handle('settings:save-proton', async (_event, configuration) => {
   return protonSettings(settings);
 });
 
-ipcMain.handle('settings:install-ge-proton', async () => {
-  const installed = await installLatestGeProton();
+ipcMain.handle('settings:list-ge-releases', async () => listGeReleases());
+ipcMain.handle('settings:install-ge-proton', async (_event, version = 'latest') => {
+  const installed = await installLatestGeProton(version);
   const settings = await readSettings();
   settings.protonPath = installed.protonPath;
   settings.umuPath = settings.umuPath || 'umu-run';
@@ -985,7 +1032,8 @@ async function diagnoseSystemHealth() {
   };
 
   if (await checkBinary('wine')) results.wine = { status: 'PASS', details: 'Wine binary found in PATH' };
-  if (await checkBinary('umu-run')) results.umu = { status: 'PASS', details: 'umu-run launcher binary found in PATH' };
+  const configured = protonSettings(await readSettings());
+  if (await checkBinary(configured.umuPath)) results.umu = { status: 'PASS', details: `Configured UMU launcher found: ${configured.umuPath}` };
   if (await checkBinary('gamemoderun')) {
     let hasLibGameMode = false;
     try {
@@ -1011,7 +1059,10 @@ async function diagnoseSystemHealth() {
   if (await checkBinary('ntlm_auth')) results.ntlmAuth = { status: 'PASS', details: 'ntlm_auth (winbind) found' };
 
   try {
-    const protonTools = await discoverCompatibilityTools();
+    const protonTools = (await discoverCompatibilityTools()).filter(tool => tool.isGe);
+    if (configured.protonPath) {
+      try { await validateProtonDirectory(configured.protonPath); protonTools.push({ name: 'Configured Proton', path: configured.protonPath }); } catch {}
+    }
     if (protonTools && protonTools.length > 0) {
       results.geProton = { status: 'PASS', details: `Found ${protonTools.length} compatibility tool(s): ${protonTools.map(t => t.name).join(', ')}` };
     }
@@ -1061,9 +1112,11 @@ ipcMain.handle('launcher:save', async (_event, game, configuration) => {
   if (typeof gameId !== 'string' || !configuration || !runners.has(configuration.runner)) throw new Error('Invalid launcher configuration.');
   const protonCompatibility = Number(configuration.protonCompatibility);
   if (!Number.isInteger(protonCompatibility) || protonCompatibility < 0 || protonCompatibility > 5) throw new Error('Proton compatibility must be a whole number from 0 to 5.');
+  splitArguments(configuration.arguments);
   const settings = await readGameSettings();
   const runsOn = configuration.runsOn && typeof configuration.runsOn === 'object' ? { windows: Boolean(configuration.runsOn.windows), linux: Boolean(configuration.runsOn.linux) } : { windows: true, linux: true };
   settings[gameId] = {
+    ...performanceSettings(configuration),
     runner: configuration.runner,
     executable: typeof configuration.executable === 'string' ? configuration.executable : '',
     workingDirectory: typeof configuration.workingDirectory === 'string' ? configuration.workingDirectory : '',
@@ -1088,23 +1141,6 @@ ipcMain.handle('launcher:save', async (_event, game, configuration) => {
   return settings[gameId];
 });
 
-function splitArguments(value) {
-  if (!value || typeof value !== 'string' || !value.trim()) return { args: [], envInjected: {} };
-  const rawTokens = value.trim().split(/\s+/);
-  const args = [];
-  const envInjected = {};
-  for (const token of rawTokens) {
-    const unquoted = token.replace(/^["']|["']$/g, '');
-    if (/^[A-Z0-9_]+=[^\s]+$/.test(unquoted)) {
-      const parts = unquoted.split('=');
-      envInjected[parts[0]] = parts.slice(1).join('=');
-    } else {
-      args.push(token);
-    }
-  }
-  return { args, envInjected };
-}
-
 function launchSpec(game, configuration) {
   const config = configuration || (game.source === 'Steam' ? { runner: 'steam' } : null);
   if (!config) throw new Error('Choose and save a launcher before launching this game.');
@@ -1115,6 +1151,9 @@ function launchSpec(game, configuration) {
   }
   if (!config.executable) throw new Error('Choose a game executable first.');
   const { args, envInjected } = splitArguments(config.arguments);
+  if (args.some(arg => /^(PROTON_|UMU_|WINE)[A-Z0-9_]*=/.test(arg))) {
+    throw new Error('Put Proton/UMU environment assignments before all game arguments, for example: PROTON_LOG=1 UMU_LOG=1 -dx11');
+  }
   const cwd = config.workingDirectory || path.dirname(config.executable);
   if (config.runner === 'native' && process.platform === 'win32') {
     if (!args.length && !config.workingDirectory) return { openPath: config.executable, env: {} };
@@ -1139,7 +1178,7 @@ function launchSpec(game, configuration) {
   }
   if (config.hideNvidiaGpu) env.PROTON_HIDE_NVIDIA_GPU = '1';
   if (config.enableNvapi) env.PROTON_ENABLE_NVAPI = '1';
-  if (config.enableMesaGlThread) env.MESA_GL_THREAD = 'true';
+  if (config.enableMesaGlThread) env.mesa_glthread = 'true';
   if (config.largeAddressAware) env.PROTON_FORCE_LARGE_ADDRESS_AWARE = '1';
   if (config.dxvkAsync) env.DXVK_ASYNC = '1';
 
@@ -1150,13 +1189,11 @@ function launchSpec(game, configuration) {
   } else if (config.runner === 'proton') {
     if (!config.protonPath) throw new Error('Choose a GE-Proton directory before launching with Proton.');
     if (!config.winePrefix) throw new Error('Choose a Wine prefix before launching with Proton.');
+    if (config.debugLogging) { env.PROTON_LOG = '1'; env.UMU_LOG = '1'; }
     env.WINEPREFIX = config.winePrefix;
     env.PROTONPATH = config.protonPath;
-    const appIdStr = game.appId || game.storeAppId || '';
-    env.GAMEID = config.umuGameId || (appIdStr ? `steam-${appIdStr}` : 'umu-default');
-    env.STORE = config.store || (game.source === 'Steam' || appIdStr || config.umuGameId ? 'steam' : 'none');
-    const parentLibDir = path.dirname(game.path);
-    env.STEAM_COMPAT_LIBRARY_PATHS = `${parentLibDir}:${game.path}`;
+    env.GAMEID = config.umuGameId || 'umu-default';
+    env.STORE = config.store || (game.source === 'Steam' ? 'steam' : 'none');
     command = config.umuPath || 'umu-run';
     commandArgs = [config.executable, ...args];
   }
@@ -1178,6 +1215,19 @@ function printableSpec(spec) {
 
 ipcMain.handle('launcher:preview', async (_event, game, configuration) => ({ command: printableSpec(launchSpec(game, configuration)) }));
 
+async function validateLaunchSpec(spec) {
+  if (spec.openExternal || spec.openPath || process.platform !== 'linux') return;
+  if (spec.cwd && !(await directoryExists(spec.cwd))) throw new Error(`Working directory does not exist: ${spec.cwd}`);
+  if (spec.env.PROTONPATH) await validateProtonDirectory(spec.env.PROTONPATH);
+  const commands = [spec.command];
+  if (spec.command === 'gamemoderun') commands.push(spec.args[0]);
+  for (const command of commands) {
+    const candidates = command.includes('/') ? [command] : (process.env.PATH || '').split(path.delimiter).map(root => path.join(root, command));
+    let found = false;
+    for (const candidate of candidates) { try { if ((await fs.stat(candidate)).isFile()) { await fs.access(candidate, fsSync.constants.X_OK); found = true; break; } } catch {} }
+    if (!found) throw new Error(`Launcher is missing or not executable: ${command}. Install it or choose its full path in settings.`);
+  }
+}
 async function installRuntimeAddon(game, configuration, addonKey) {
   if (process.platform !== 'linux') throw new Error('Runtime addon installer is for Linux Wine/Proton setups.');
   const config = configuration || {};
@@ -1252,6 +1302,7 @@ async function installRuntimeAddon(game, configuration, addonKey) {
   };
 
   const spec = launchSpec(game, installerConfig);
+  await validateLaunchSpec(spec);
   const printable = printableSpec(spec);
   broadcastLog({ type: 'system', text: `[${new Date().toLocaleTimeString()}] Running ${addon.name} installer in prefix...\nCommand: ${printable}\n` });
 
@@ -1301,6 +1352,8 @@ ipcMain.handle('launcher:install-runtime-addon', async (_event, game, configurat
 
 ipcMain.handle('launcher:launch', async (_event, game, configuration) => {
   const spec = launchSpec(game, configuration);
+  await validateLaunchSpec(spec);
+  if (configuration?.executable && configuration.runner !== 'steam') await fs.access(configuration.executable);
   const printable = printableSpec(spec);
 
   const broadcastStatus = (statusObj) => {
@@ -1347,7 +1400,10 @@ ipcMain.handle('launcher:launch', async (_event, game, configuration) => {
         stdio: ['ignore', 'pipe', 'pipe']
       });
 
-      broadcastStatus({ state: 'running', pid: child.pid, command: printable, gameName: game.name });
+      child.once('spawn', () => {
+        broadcastStatus({ state: 'running', pid: child.pid, command: printable, gameName: game.name });
+        resolve({ command: printable, pid: child.pid });
+      });
 
       child.stdout.on('data', (chunk) => {
         broadcastLog({ type: 'stdout', text: chunk.toString('utf8') });
@@ -1370,7 +1426,6 @@ ipcMain.handle('launcher:launch', async (_event, game, configuration) => {
       });
 
       child.unref();
-      resolve({ command: printable, pid: child.pid });
     } catch (err) {
       broadcastStatus({ state: 'error', error: err.message });
       broadcastLog({ type: 'error', text: `[LAUNCH ERROR] ${err.message}\n` });

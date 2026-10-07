@@ -12,7 +12,7 @@ Steam games and games kept on a network server.
 - Saves per-game launch settings in `~/.config/xp-game-manager/game-launchers.json`.
 - Lets you record a Proton compatibility rating from 0 (no reported support) to 5 (highest support) per game.
 - Provides a command preview before an explicit launch action.
-- Launches Steam games through Steam, or explicitly configured games through a native executable, Wine, or a Proton tool script.
+- Launches Steam games through Steam, or explicitly configured games through a native executable, Wine, or GE-Proton through UMU.
 - Includes a desktop-only Torbox Downloads tab for user-supplied, authorized magnet links. It submits the link to Torbox, shows processing status, and saves selected completed files to a directory you choose.
 - Serves a read-only browser library alongside the desktop app at port `3838`.
 
@@ -167,8 +167,8 @@ reads the mounted directory; it does not handle server credentials or mounts.
 Select a game card to open its launcher panel. Steam cards default to Steam's
 own Proton configuration. For a non-Steam game, choose an executable and save
 an explicit runner configuration before launching. Wine settings support a
-custom binary and `WINEPREFIX`; Proton settings require a Proton tool script
-and compatibility-data path. On Linux, **Global Proton settings** can install
+custom binary and `WINEPREFIX`; Proton settings require a GE-Proton directory, an installed UMU launcher,
+and a local Wine prefix. On Linux, **Global Proton settings** can install
 or update the latest GE-Proton release after verifying its SHA-512 checksum.
 It configures GE-Proton to run non-Steam titles through `umu-run`, which
 provides the Steam-compatible container runtime GE-Proton requires. The same
@@ -192,3 +192,27 @@ npm run dev
 Electron builds need the normal Linux desktop dependencies available on the
 host. This scaffold has intentionally kept the backend small so Steam, Lutris,
 Heroic, Bottles, and per-game launch integrations can be added independently.
+
+## Proton troubleshooting and verification
+
+Install `umu-launcher` using your distribution's package manager before launching
+non-Steam Windows games with Proton. In Global Proton settings, enter the full
+path to `umu-run` if it is unavailable in the desktop session's PATH. Install
+GE-Proton, then select Proton in the game's launcher and choose the executable.
+The default prefix is stored locally, separately for each game.
+
+Arguments support quoted values, empty arguments, and escaped spaces. Leading
+assignments such as `PROTON_LOG=1 UMU_LOG=1 --windowed` set environment variables;
+assignments after the first argument are passed to the game. Store metadata used
+for artwork does not select the UMU storefront. Set Store Context to the actual
+store (`steam`, `gog`, or `egs`) and use a UMU database ID for game-specific fixes.
+
+Downloads have a timeout and enter the cache only after completion. GE-Proton
+archives are checksum verified, extracted into staging, and validated before
+installation. An incomplete existing installation produces an error asking you
+to move it aside; it is not silently overwritten. Launcher startup errors are
+reported before the app announces a running process.
+
+Run `npm test` for launcher regression checks. Hardware Vulkan capability checks,
+a first-run setup wizard, automatic UMU database lookup, global version
+inheritance, and prefix backup/repair remain future improvements.

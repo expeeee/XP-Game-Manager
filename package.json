@@ -6,7 +6,8 @@
   "main": "src/main.cjs",
   "scripts": {
     "dev": "electron .",
-    "start": "electron ."
+    "start": "electron .",
+    "test": "node --test test/*.test.cjs"
   },
   "devDependencies": {
     "electron": "^37.10.3"

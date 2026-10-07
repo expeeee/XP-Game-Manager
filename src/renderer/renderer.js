@@ -84,27 +84,59 @@ function input(label, value, onChange, placeholder = '') {
   control.addEventListener('input', () => onChange(control.value)); field.append(title, control); return field;
 }
 
+function protonDirectoryInput(label, value, onChange) {
+  const field = input(label, value, onChange, '/path/to/GE-Proton');
+  const browse = document.createElement('button'); browse.type = 'button'; browse.textContent = 'Browse…';
+  browse.addEventListener('click', async () => {
+    browse.disabled = true;
+    try {
+      const chosen = await window.libraryApi.chooseProtonDirectory();
+      if (chosen) { field.querySelector('input').value = chosen; onChange(chosen); }
+    } catch (error) { $('#status').textContent = error.message || 'Unable to select Proton directory.'; }
+    finally { browse.disabled = false; }
+  });
+  field.append(browse);
+  return field;
+}
+
 function renderGlobalProtonSettings() {
   $('#global-proton-settings')?.remove();
   if (libraryData?.hostPlatform !== 'linux') return;
   const configuration = { ...libraryData.protonSettings };
   const panel = document.createElement('details'); panel.id = 'global-proton-settings'; panel.className = 'advanced-proton';
   const summary = document.createElement('summary'); summary.textContent = 'Global Proton settings'; panel.append(summary);
-  panel.append(input('GE-Proton directory', configuration.protonPath, value => { configuration.protonPath = value; }, '/path/to/GE-Proton'));
+  panel.append(protonDirectoryInput('GE-Proton directory', configuration.protonPath, value => { configuration.protonPath = value; }));
   panel.append(input('UMU launcher', configuration.umuPath, value => { configuration.umuPath = value; }, 'umu-run'));
   panel.append(input('Compatibility-data root', configuration.compatDataRoot, value => { configuration.compatDataRoot = value; }, '/home/user/.local/share/xp-game-manager/compatdata'));
   const actions = document.createElement('div'); actions.className = 'launcher-actions';
-  const installGe = document.createElement('button'); installGe.textContent = 'Install / update latest GE-Proton';
-  installGe.addEventListener('click', async () => {
-    installGe.disabled = true; $('#status').textContent = 'Downloading and verifying the latest GE-Proton release…';
+  const versionSelect = document.createElement('select');
+  versionSelect.setAttribute('aria-label', 'GE-Proton version to install');
+  const latest = document.createElement('option'); latest.value = 'latest'; latest.textContent = 'Latest GE-Proton'; versionSelect.append(latest);
+  const versions = document.createElement('button'); versions.textContent = 'Load available versions';
+  versions.addEventListener('click', async () => {
+    versions.disabled = true;
     try {
-      const result = await window.libraryApi.installGeProton();
+      const releases = await window.libraryApi.listGeReleases();
+      versionSelect.replaceChildren(latest);
+      for (const release of releases) { const option = document.createElement('option'); option.value = release.version; option.textContent = release.version; versionSelect.append(option); }
+      $('#status').textContent = `Loaded ${releases.length} GE-Proton versions.`;
+    } catch (error) { $('#status').textContent = error.message || 'Unable to load versions.'; }
+    finally { versions.disabled = false; }
+  });
+  const hint = document.createElement('p'); hint.className = 'hint'; hint.textContent = 'Installs side by side in your home directory. Root access is not required. Existing game configurations retain their selected version.';
+  panel.append(hint, versionSelect, versions);
+  const installGe = document.createElement('button'); installGe.textContent = 'Install selected GE-Proton';
+  installGe.addEventListener('click', async () => {
+    installGe.disabled = true; versionSelect.disabled = true; versions.disabled = true; $('#status').textContent = `Downloading and verifying ${versionSelect.value} GE-Proton…`;
+    try {
+      const result = await window.libraryApi.installGeProton(versionSelect.value);
       libraryData.protonSettings = result.settings;
+      discoveredProtonTools = await window.libraryApi.discoverCompatibilityTools();
       configuration.protonPath = result.protonPath;
       $('#status').textContent = result.alreadyInstalled ? `${result.version} is already installed.` : `${result.version} installed and selected.`;
       renderGlobalProtonSettings();
     } catch (error) { $('#status').textContent = error.message || 'Unable to install GE-Proton.'; }
-    finally { installGe.disabled = false; }
+    finally { installGe.disabled = false; versionSelect.disabled = false; versions.disabled = false; }
   });
   const save = document.createElement('button'); save.textContent = 'Save global Proton settings';
   save.addEventListener('click', async () => {
@@ -369,7 +401,7 @@ async function selectGame(game) {
     winePrefix: game.defaultCompatDataPath || '',
     protonPath: libraryData?.protonSettings?.protonPath || '',
     umuPath: libraryData?.protonSettings?.umuPath || 'umu-run',
-    arguments: game.suggestedArguments?.join(' ') || '',
+    arguments: game.suggestedArguments?.map(arg => JSON.stringify(arg)).join(' ') || '',
     protonCompatibility: game.protonCompatibility || 0,
     runsOn: game.runsOn || { windows: true, linux: true },
     gameMode: false,
@@ -396,9 +428,10 @@ function renderLauncher(game, config) {
   const panel = $('#launcher-panel'); panel.replaceChildren();
   panel.innerHTML = `<p class="eyebrow">LAUNCHER</p><h2>${game.name}</h2><p class="muted">${game.path}</p>`;
   const runner = document.createElement('select');
+  // Compatibility metadata describes the game; it must not block launcher setup.
   const runnerOptions = libraryData?.hostPlatform === 'win32'
-    ? ['steam', ...(config.runsOn.windows ? ['native'] : [])]
-    : ['steam', ...(config.runsOn.linux ? ['native'] : []), ...(config.runsOn.windows ? ['wine', 'proton'] : [])];
+    ? ['steam', 'native']
+    : ['steam', 'native', 'wine', 'proton'];
   for (const option of runnerOptions) {
     const item = document.createElement('option'); item.value = option;
     item.textContent = option === 'steam'
@@ -478,7 +511,7 @@ function renderLauncher(game, config) {
       }
       protonField.append(protonSelect); panel.append(protonField);
 
-      const protonPathInput = input('Proton path', config.protonPath, value => { config.protonPath = value; }, '/path/to/GE-Proton');
+      const protonPathInput = protonDirectoryInput('Proton directory', config.protonPath, value => { config.protonPath = value; });
       protonPathInput.hidden = protonSelect.value !== 'custom';
       panel.append(protonPathInput);
 
@@ -509,6 +542,7 @@ function renderLauncher(game, config) {
       label.append(box, labelText); togglesGrid.append(label);
     };
 
+    if (config.runner === 'proton') addToggle('debugLogging', 'Enable Proton / UMU debug logs');
     addToggle('gameMode', 'GameMode');
     addToggle('mangoHud', 'MangoHud');
     addToggle('useWineD3D', 'WineD3D');
@@ -562,8 +596,8 @@ function renderLauncher(game, config) {
     fsrField.append(fsrSelect); envSection.append(fsrField);
 
     envSection.append(input('DXVK HUD (optional)', config.dxvkHud || '', value => { config.dxvkHud = value; }, 'compiler,fps'));
-    envSection.append(input('UMU Store Context', config.store || '', value => { config.store = value; }, 'steam / gog / epic'));
-    envSection.append(input('UMU Game ID Override', config.umuGameId || '', value => { config.umuGameId = value; }, 'steam-730 or umu-12345'));
+    envSection.append(input('UMU Store Context', config.store || '', value => { config.store = value; }, 'steam / gog / egs'));
+    envSection.append(input('UMU Game ID Override', config.umuGameId || '', value => { config.umuGameId = value; }, 'umu-default or a UMU database ID'));
 
     panel.append(envSection);
   }
@@ -597,7 +631,7 @@ function renderLauncher(game, config) {
     const addonSelect = document.createElement('select');
     const addonOptions = [
       { value: 'vc_redist', label: 'Visual C++ 2015-2022' },
-      { value: 'directx', label: 'DirectX Runtimes (Jun2010)' },
+      { value: 'directx', label: 'DirectX Web Runtime' },
       { value: 'dotnet', label: 'Microsoft .NET Desktop 8' },
       { value: 'openal', label: 'OpenAL Audio Installer' }
     ];

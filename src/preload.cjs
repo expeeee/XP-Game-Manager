@@ -21,10 +21,12 @@ contextBridge.exposeInMainWorld('libraryApi', {
     ipcRenderer.on('torbox:progress', listener);
     return () => ipcRenderer.removeListener('torbox:progress', listener);
   },
+  chooseProtonDirectory: () => ipcRenderer.invoke('settings:choose-proton-directory'),
   discoverCompatibilityTools: () => ipcRenderer.invoke('settings:discover-proton-tools'),
   diagnoseSystemHealth: () => ipcRenderer.invoke('system:diagnose-health'),
   saveProtonSettings: (configuration) => ipcRenderer.invoke('settings:save-proton', configuration),
-  installGeProton: () => ipcRenderer.invoke('settings:install-ge-proton'),
+  listGeReleases: () => ipcRenderer.invoke('settings:list-ge-releases'),
+  installGeProton: (version) => ipcRenderer.invoke('settings:install-ge-proton', version),
   chooseExecutable: () => ipcRenderer.invoke('launcher:choose-executable'),
   getLauncher: (gameId) => ipcRenderer.invoke('launcher:get', gameId),
   saveLauncher: (game, configuration) => ipcRenderer.invoke('launcher:save', game, configuration),
