@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' https://cdn.akamai.steamstatic.com https://shared.akamai.steamstatic.com data:; style-src 'self' 'unsafe-inline'; script-src 'self'; base-uri 'none';" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' https://imageban.ru https://*.imageban.ru https://riotpixels.net https://*.riotpixels.net https://fastpic.ru https://*.fastpic.ru https://fitgirl-repacks.site https://*.fitgirl-repacks.site https://steamstatic.com https://*.steamstatic.com https://cdn.akamai.steamstatic.com https://shared.akamai.steamstatic.com data:; style-src 'self' 'unsafe-inline'; script-src 'self'; base-uri 'none';" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>XP Game Manager</title>
     <link rel="stylesheet" href="styles.css" />
@@ -11,14 +11,62 @@
     <main>
       <header>
         <div><p class="eyebrow">LOCAL-FIRST LIBRARY</p><h1>XP Game Manager</h1></div>
-        <div class="header-actions"><button class="tab-button active" id="library-tab" aria-selected="true">Library</button><button class="tab-button" id="downloads-tab" aria-selected="false">Downloads</button><button id="discover-games">Discover game info &amp; art</button> <button id="rescan">Rescan libraries</button></div>
+        <div class="header-actions"><button class="tab-button active" id="library-tab" aria-selected="true">Library</button><button class="tab-button" id="downloads-tab" aria-selected="false">Downloads</button><button class="tab-button" id="fitgirl-tab" aria-selected="false">FitGirl</button><button id="discover-games">Discover game info &amp; art</button> <button id="rescan">Rescan libraries</button></div>
       </header>
       <div id="library-view"><section class="intro"><div><h2>Your games, wherever they live</h2><p>Steam installations are discovered automatically. <code>/Beta/WindowsGames</code> is included as the first Windows-game library; add any other mounted folder to browse it too.</p></div><button class="primary" id="add-library">Add library folder</button></section>
         <div class="library-controls"><input id="search-games" type="search" placeholder="Search your games" /><select id="source-filter"><option value="all">All sources</option><option value="Steam">Steam</option><option value="Server folder">Folder libraries</option></select></div>
         <p id="status" class="status">Loading your libraries…</p>
         <div class="library-layout"><div><section><div class="section-title"><h2>Steam</h2><span id="steam-count"></span></div><div id="steam-games" class="game-grid"></div><p id="steam-empty" class="empty" hidden>No installed Steam games were found in the standard Steam locations.</p></section><section><div class="section-title"><h2>Folder libraries</h2><span id="server-count"></span></div><div id="server-libraries" class="server-libraries"></div></section></div><aside id="launcher-panel" class="launcher-panel"><p class="eyebrow">LAUNCHER</p><h2>Select a game</h2><p class="muted">Choose a card to configure a safe launch command.</p></aside></div></div>
-      <section id="downloads-view" hidden><div class="downloads-heading"><div><p class="eyebrow">TORBOX</p><h2>Downloads</h2><p class="muted">Paste a magnet link for content you are authorized to download. Torbox transfers it to your chosen folder.</p></div><button id="refresh-downloads">Refresh status</button></div><div id="torbox-panel" class="download-panel"></div><div id="torbox-jobs" class="download-jobs"></div></section>
+      <section id="downloads-view" hidden><div class="downloads-heading"><div><p class="eyebrow">TORBOX</p><h2>Downloads</h2><p class="muted">Paste a magnet link for content you are authorized to download. Torbox transfers it to your chosen folder.</p></div><button id="refresh-downloads">Refresh status</button></div>
+        <div id="torbox-panel" class="download-panel"></div>
+        <div id="download-queue-section" class="download-queue-section">
+          <div class="section-title"><h2>Download Queue</h2><span id="queue-count"></span></div>
+          <div id="download-queue-list" class="download-queue-list"></div>
+        </div>
+        <div id="torbox-jobs" class="download-jobs"></div>
+      </section>
+      <section id="fitgirl-view" hidden><div class="downloads-heading"><div><p class="eyebrow">FITGIRL REPACKS</p><h2>Browse &amp; download repacks</h2><p class="muted">Search the FitGirl catalog or pick a top repack. Choosing a game resolves its download link; add it to Torbox to transfer it to your chosen folder. Only download content you are authorized to use.</p></div></div>
+        <div class="fitgirl-toolbar">
+          <input id="fitgirl-search" type="search" placeholder="Search FitGirl repacks (e.g. Elden Ring, Cyberpunk 2077)…" />
+          <button id="fitgirl-search-btn" class="primary">Search</button>
+          <div class="fitgirl-top-toggle" role="group" aria-label="Top repacks period">
+            <button id="fitgirl-top-month" class="toggle-btn active">Top 50 · This month</button>
+            <button id="fitgirl-top-year" class="toggle-btn">Top 150 · All time</button>
+          </div>
+        </div>
+        <p id="fitgirl-status" class="status"></p>
+        <div id="fitgirl-results" class="fitgirl-results"></div>
+        <div id="fitgirl-authorization" class="fitgirl-authorization" hidden>
+          <label><input type="checkbox" id="fitgirl-auth-checked" /> I confirm I am authorized to download this content.</label>
+          <div class="launcher-actions">
+            <button id="fitgirl-add" class="primary">Add to Torbox</button>
+            <button id="fitgirl-auth-cancel">Cancel</button>
+          </div>
+        </div>
+      </section>
     </main>
+    <div id="fitgirl-detail-modal" class="modal-overlay" hidden>
+      <article class="modal-card fitgirl-detail-card" role="dialog" aria-modal="true" aria-labelledby="fitgirl-detail-title">
+        <div class="modal-header">
+          <h3 id="fitgirl-detail-title">Repack details</h3>
+          <button id="fitgirl-detail-close" class="button-small" aria-label="Close details">✕</button>
+        </div>
+        <div class="modal-body fitgirl-detail-body">
+          <img id="fitgirl-detail-image" class="fitgirl-detail-image" alt="" hidden />
+          <div id="fitgirl-detail-placeholder" class="fitgirl-art-placeholder">GAME DETAILS</div>
+          <p id="fitgirl-detail-summary" class="muted"></p>
+          <dl class="fitgirl-detail-metadata">
+            <div><dt>Repack size</dt><dd id="fitgirl-detail-size"></dd></div>
+            <div><dt>Download name</dt><dd id="fitgirl-detail-download-name"></dd></div>
+          </dl>
+          <p id="fitgirl-detail-status" class="status"></p>
+          <div class="launcher-actions">
+            <button id="fitgirl-detail-download" class="primary">Download</button>
+            <button id="fitgirl-detail-close-secondary">Close</button>
+          </div>
+        </div>
+      </article>
+    </div>
     <template id="game-card"><article class="game-card" tabindex="0"><div class="game-icon">🎮</div><div><div class="card-header"><h3></h3><span class="protondb-badge" hidden></span></div><p class="source"></p><p class="compatibility"></p><p class="summary"></p><p class="path"></p></div></article></template>
 
     <!-- Debug Terminal Drawer -->
@@ -55,7 +103,8 @@
           <div id="steam-search-results" class="search-results-list"></div>
         </div>
       </div>
-    </div>
+    <!-- Toast Notification Container -->
+    <div id="toast-container" class="toast-container" aria-live="polite"></div>
 
     <script src="renderer.js"></script>
   </body>

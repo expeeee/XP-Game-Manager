@@ -24,7 +24,8 @@ folder-library settings as the desktop application. The web interface exposes
 only the game inventory; it has no configuration, folder-management, or launch
 actions. Its discovery button writes only a local artwork/metadata cache. Torbox
 downloads are available only in the desktop app and are never exposed through
-the LAN interface.
+the LAN interface. The desktop-only FitGirl tab shows a searchable/top-repacks
+catalog with artwork and opens a detail dialog when a repack row is selected.
 
 ## Torbox downloads
 
@@ -176,6 +177,23 @@ panel provides defaults for the GE-Proton directory, UMU launcher, and
 compatibility-data root; each non-Steam game receives its own Wine prefix
 below that root. The compatibility rating is informational and is shown by
 both interfaces.
+
+On Linux, configured folder games with an executable inside the game folder
+can be copied to an SSD/NVMe from the launch panel using **Copy to fast
+storage**. Choose a destination folder first; the first copy shows progress and
+can be cancelled. After copying, enable **Launch this game from fast storage**
+to opt in per game, or leave it unchecked to launch from the original location.
+**Refresh staged copy** writes a new version and leaves old copies intact, so
+it does not replace files under a running game. Choose a different destination
+to move future staged copies to another drive. Old versions are not removed
+automatically; delete them from their fast-storage folders when they are no
+longer needed. Steam-managed launches are not staged.
+
+Staging copies the complete game folder, not just read-only assets. Some games
+write saves or settings beside the executable; those writes stay in the staged
+copy and are not synced back to the original. Back up such saves and verify
+where a game stores them before staging. Symbolic links are copied as links,
+so files reached through links may still be read from their original location.
 
 Discovery and saving a folder game's launcher write portable facts to
 `<game folder>/.linux-game-manager.json`: relative Windows executable and

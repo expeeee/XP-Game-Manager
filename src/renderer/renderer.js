@@ -4,6 +4,7 @@ let libraryData = null;
 let torboxSettings = null;
 let torboxJobs = [];
 let torboxRefreshTimer = null;
+let fastMediaCopyRequestId = null;
 const torboxProgress = new Map();
 const minimizedTorboxJobs = new Set();
 
@@ -241,16 +242,17 @@ function isOverallProgress(progress) {
 }
 
 function switchView(view) {
-  const downloads = view === 'downloads';
-  $('#library-view').hidden = downloads;
-  $('#downloads-view').hidden = !downloads;
-  $('#library-tab').classList.toggle('active', !downloads);
-  $('#downloads-tab').classList.toggle('active', downloads);
-  $('#library-tab').setAttribute('aria-selected', String(!downloads));
-  $('#downloads-tab').setAttribute('aria-selected', String(downloads));
+  const active = { library: 'library-view', downloads: 'downloads-view', fitgirl: 'fitgirl-view' }[view] || 'library-view';
+  for (const [name, id] of Object.entries({ library: 'library-view', downloads: 'downloads-view', fitgirl: 'fitgirl-view' })) {
+    const element = document.getElementById(id);
+    if (element) element.hidden = id !== active;
+    const tab = document.getElementById(`${name}-tab`);
+    if (tab) { tab.classList.toggle('active', id === active); tab.setAttribute('aria-selected', String(id === active)); }
+  }
   clearInterval(torboxRefreshTimer);
-  torboxRefreshTimer = downloads ? setInterval(() => { void loadTorboxJobs(); }, 15000) : null;
-  if (downloads) void loadTorbox();
+  torboxRefreshTimer = view === 'downloads' ? setInterval(() => { void loadTorboxJobs(); }, 15000) : null;
+  if (view === 'downloads') { void loadTorbox(); renderDownloadQueue(); }
+  if (view === 'fitgirl') void loadFitGirlTop('month');
 }
 
 function downloadsMessage(message, isError = false) {
@@ -387,11 +389,561 @@ let activeGameForSearch = null;
 let discoveredProtonTools = [];
 
 async function loadTorbox() {
-  try { torboxSettings = await window.libraryApi.getTorboxSettings(); renderTorbox(); await loadTorboxJobs(); }
-  catch (error) { downloadsMessage(error.message || 'Unable to load Torbox settings.', true); }
+  try {
+    torboxSettings = await window.libraryApi.getTorboxSettings();
+    renderTorbox();
+    renderDownloadQueue();
+    await loadTorboxJobs();
+  } catch (error) {
+    downloadsMessage(error.message || 'Unable to load Torbox settings.', true);
+  }
+}
+
+// --- Toast Notifications ---
+function showToast({ message, title = '', type = 'info', actionLabel = null, onAction = null, duration = 4000 }) {
+  let container = $('#toast-container');
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'toast-container';
+    container.className = 'toast-container';
+    document.body.append(container);
+  }
+
+  const toast = document.createElement('div');
+  toast.className = `toast toast-${type}`;
+  toast.setAttribute('role', 'alert');
+
+  const iconMap = { info: '📥', success: '✅', warning: '⚠️', error: '❌' };
+  const icon = document.createElement('span');
+  icon.className = 'toast-icon';
+  icon.textContent = iconMap[type] || 'ℹ️';
+
+  const content = document.createElement('div');
+  content.className = 'toast-content';
+
+  if (title) {
+    const titleEl = document.createElement('strong');
+    titleEl.className = 'toast-title';
+    titleEl.textContent = title;
+    content.append(titleEl);
+  }
+
+  const messageEl = document.createElement('p');
+  messageEl.className = 'toast-message';
+  messageEl.textContent = message;
+  content.append(messageEl);
+
+  toast.append(icon, content);
+
+  const dismiss = () => {
+    if (toast.classList.contains('toast-dismissing')) return;
+    toast.classList.add('toast-dismissing');
+    toast.addEventListener('animationend', () => toast.remove(), { once: true });
+  };
+
+  if (actionLabel && typeof onAction === 'function') {
+    const actionBtn = document.createElement('button');
+    actionBtn.className = 'button-small primary toast-action';
+    actionBtn.textContent = actionLabel;
+    actionBtn.addEventListener('click', () => {
+      onAction();
+      dismiss();
+    });
+    toast.append(actionBtn);
+  }
+
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'toast-close';
+  closeBtn.setAttribute('aria-label', 'Close notification');
+  closeBtn.textContent = '✕';
+  closeBtn.addEventListener('click', dismiss);
+  toast.append(closeBtn);
+
+  container.append(toast);
+
+  if (duration > 0) {
+    setTimeout(() => {
+      if (toast.isConnected) dismiss();
+    }, duration);
+  }
+
+  return { dismiss };
+}
+
+// --- Download Queue System ---
+let downloadQueue = [];
+let isProcessingQueue = false;
+
+function loadDownloadQueue() {
+  try {
+    const saved = localStorage.getItem('xpgm_download_queue');
+    downloadQueue = saved ? JSON.parse(saved) : [];
+    if (!Array.isArray(downloadQueue)) downloadQueue = [];
+  } catch {
+    downloadQueue = [];
+  }
+}
+
+function saveDownloadQueue() {
+  try {
+    localStorage.setItem('xpgm_download_queue', JSON.stringify(downloadQueue));
+  } catch {}
+}
+
+function renderDownloadQueue() {
+  const container = $('#download-queue-list');
+  const countEl = $('#queue-count');
+  if (!container) return;
+  container.replaceChildren();
+
+  if (countEl) {
+    countEl.textContent = downloadQueue.length
+      ? `${downloadQueue.length} item${downloadQueue.length === 1 ? '' : 's'}`
+      : '';
+  }
+
+  if (!downloadQueue.length) {
+    const empty = document.createElement('p');
+    empty.className = 'queue-empty';
+    empty.textContent = 'No downloads in queue. Items downloaded from the FitGirl tab will appear here while being processed.';
+    container.append(empty);
+    return;
+  }
+
+  for (const item of downloadQueue) {
+    const card = document.createElement('div');
+    card.className = 'queue-item';
+
+    const art = document.createElement('div');
+    art.className = 'queue-item-art';
+    if (item.imageUrl) {
+      const img = document.createElement('img');
+      img.src = item.imageUrl;
+      img.alt = '';
+      img.onerror = () => { art.textContent = 'GAME'; };
+      art.append(img);
+    } else {
+      art.textContent = 'GAME';
+    }
+
+    const meta = document.createElement('div');
+    meta.className = 'queue-item-meta';
+
+    const title = document.createElement('h4');
+    title.textContent = item.title;
+
+    const sub = document.createElement('p');
+    sub.textContent = [item.sizeLabel, item.downloadName].filter(Boolean).join(' · ') || 'FitGirl Repack';
+
+    const statusRow = document.createElement('div');
+    statusRow.className = 'queue-status-row';
+
+    const badge = document.createElement('span');
+    badge.className = `queue-badge ${item.status || 'resolving'}`;
+    const badgeLabels = {
+      resolving: 'Resolving',
+      ready: 'Ready',
+      submitting: 'Submitting',
+      needs_destination: 'Needs Folder',
+      error: 'Error',
+      transferred: 'Added'
+    };
+    badge.textContent = badgeLabels[item.status] || item.status.toUpperCase();
+
+    const statusText = document.createElement('span');
+    statusText.textContent = item.statusMessage || '';
+    if (item.status === 'error') statusText.style.color = '#fca5a5';
+
+    statusRow.append(badge, statusText);
+    meta.append(title, sub, statusRow);
+
+    const actions = document.createElement('div');
+    actions.className = 'queue-item-actions';
+
+    if (item.status === 'needs_destination') {
+      const chooseBtn = document.createElement('button');
+      chooseBtn.className = 'button-small primary';
+      chooseBtn.textContent = 'Choose folder';
+      chooseBtn.addEventListener('click', async () => {
+        const picked = await window.libraryApi.chooseTorboxDirectory();
+        if (picked) {
+          if (!torboxSettings) torboxSettings = { connected: true, destination: picked };
+          else torboxSettings.destination = picked;
+          await window.libraryApi.saveTorboxSettings({ destination: picked });
+          item.status = 'ready';
+          item.statusMessage = 'Folder set. Adding to Torbox…';
+          saveDownloadQueue();
+          renderDownloadQueue();
+          void processDownloadQueue();
+        }
+      });
+      actions.append(chooseBtn);
+    }
+
+    if (item.status === 'error') {
+      const retryBtn = document.createElement('button');
+      retryBtn.className = 'button-small';
+      retryBtn.textContent = 'Retry';
+      retryBtn.addEventListener('click', () => {
+        item.status = item.magnet ? 'ready' : 'resolving';
+        item.statusMessage = item.magnet ? 'Retrying Torbox submission…' : 'Resolving download link…';
+        saveDownloadQueue();
+        renderDownloadQueue();
+        void processDownloadQueue();
+      });
+      actions.append(retryBtn);
+    }
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'button-small quiet';
+    cancelBtn.textContent = '✕ Cancel';
+    cancelBtn.title = 'Remove from queue';
+    cancelBtn.addEventListener('click', () => {
+      downloadQueue = downloadQueue.filter((q) => q.id !== item.id);
+      saveDownloadQueue();
+      renderDownloadQueue();
+      showToast({ message: `Removed "${item.title}" from download queue.` });
+    });
+    actions.append(cancelBtn);
+
+    card.append(art, meta, actions);
+    container.append(card);
+  }
+}
+
+async function processDownloadQueue() {
+  if (isProcessingQueue) return;
+  isProcessingQueue = true;
+  try {
+    for (const item of downloadQueue) {
+      if (item.status === 'resolving') {
+        item.statusMessage = 'Resolving magnet from FitGirl…';
+        renderDownloadQueue();
+        try {
+          const resolved = await window.libraryApi.resolveFitGirl(item.slug);
+          item.magnet = resolved.magnet;
+          item.infoHash = resolved.infoHash;
+          if (!item.downloadName) item.downloadName = resolved.downloadName;
+          if (!item.sizeLabel) item.sizeLabel = resolved.sizeLabel;
+          if (!item.imageUrl && resolved.imageUrl) item.imageUrl = resolved.imageUrl;
+          item.status = 'ready';
+          item.statusMessage = 'Link resolved. Ready for Torbox.';
+          saveDownloadQueue();
+          renderDownloadQueue();
+        } catch (error) {
+          item.status = 'error';
+          item.statusMessage = error.message || 'Failed to resolve repack link.';
+          saveDownloadQueue();
+          renderDownloadQueue();
+          showToast({ type: 'error', title: 'Resolution Failed', message: `Could not resolve "${item.title}": ${error.message}` });
+          continue;
+        }
+      }
+
+      if (item.status === 'ready') {
+        if (!torboxSettings) {
+          try { torboxSettings = await window.libraryApi.getTorboxSettings(); }
+          catch { torboxSettings = null; }
+        }
+        let destination = torboxSettings?.destination || '';
+        if (!destination) {
+          item.status = 'needs_destination';
+          item.statusMessage = 'Choose a download directory in Torbox settings.';
+          saveDownloadQueue();
+          renderDownloadQueue();
+          continue;
+        }
+
+        item.status = 'submitting';
+        item.statusMessage = 'Submitting to Torbox…';
+        renderDownloadQueue();
+        try {
+          await window.libraryApi.addTorboxMagnet({ magnet: item.magnet, destination, title: item.title });
+          item.status = 'transferred';
+          item.statusMessage = 'Added to Torbox!';
+          saveDownloadQueue();
+          renderDownloadQueue();
+          showToast({
+            type: 'success',
+            title: 'Download Queued',
+            message: `"${item.title}" added to Torbox! Tracking download.`,
+            actionLabel: 'View in Downloads',
+            onAction: () => switchView('downloads')
+          });
+          void loadTorboxJobs();
+          setTimeout(() => {
+            downloadQueue = downloadQueue.filter((q) => q.id !== item.id);
+            saveDownloadQueue();
+            renderDownloadQueue();
+          }, 3500);
+        } catch (error) {
+          item.status = 'error';
+          item.statusMessage = error.message || 'Failed to add to Torbox.';
+          saveDownloadQueue();
+          renderDownloadQueue();
+          showToast({ type: 'error', title: 'Torbox Error', message: `Could not add "${item.title}" to Torbox: ${error.message}` });
+        }
+      }
+    }
+  } finally {
+    isProcessingQueue = false;
+  }
+}
+
+function queueFitGirlDownload(result) {
+  if (!result) return;
+  const existing = downloadQueue.find((q) => (result.slug && q.slug === result.slug) || (result.infoHash && q.infoHash === result.infoHash) || q.title === result.title);
+  if (existing) {
+    showToast({
+      type: 'info',
+      message: `"${result.title}" is already in your download queue.`,
+      actionLabel: 'View in Downloads',
+      onAction: () => switchView('downloads')
+    });
+    return;
+  }
+
+  const queueItem = {
+    id: `queue-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    title: result.title || 'Untitled repack',
+    slug: result.slug || '',
+    magnet: result.magnet || '',
+    infoHash: result.infoHash || '',
+    sizeLabel: result.sizeLabel || '',
+    downloadName: result.downloadName || '',
+    imageUrl: result.imageUrl || '',
+    status: result.magnet ? 'ready' : 'resolving',
+    statusMessage: result.magnet ? 'Ready for Torbox transfer' : 'Resolving download link…',
+    addedAt: new Date().toISOString()
+  };
+
+  downloadQueue.unshift(queueItem);
+  saveDownloadQueue();
+  renderDownloadQueue();
+
+  showToast({
+    type: 'info',
+    title: 'Download Queued',
+    message: `"${queueItem.title}" has been added to your downloads queue.`,
+    actionLabel: 'View in Downloads',
+    onAction: () => switchView('downloads')
+  });
+
+  void processDownloadQueue();
+}
+
+// --- FitGirl Repacks (read-only catalog; download is routed through Torbox) ---
+let fitgirlPendingMagnet = null;
+let fitgirlPendingTitle = '';
+let fitgirlSelectedResult = null;
+
+function fitgirlMessage(message, isError = false) {
+  const el = $('#fitgirl-status');
+  if (el) { el.textContent = message; el.classList.toggle('error', Boolean(isError)); }
+}
+
+function openFitGirlAuthorization({ magnet, title }) {
+  fitgirlPendingMagnet = magnet;
+  fitgirlPendingTitle = title;
+  const box = $('#fitgirl-authorization');
+  const checkbox = $('#fitgirl-auth-checked');
+  if (checkbox) checkbox.checked = false;
+  if (box) box.hidden = false;
+  fitgirlMessage(`Ready to add "${title}" to Torbox.`);
+}
+
+function closeFitGirlDetails() {
+  $('#fitgirl-detail-modal').hidden = true;
+  fitgirlSelectedResult = null;
+}
+
+function updateFitGirlDetails(result) {
+  $('#fitgirl-detail-title').textContent = result.title || 'Untitled repack';
+  $('#fitgirl-detail-summary').textContent = result.description || 'No description is available for this repack.';
+  $('#fitgirl-detail-size').textContent = result.sizeLabel || 'Not listed';
+  $('#fitgirl-detail-download-name').textContent = result.downloadName || 'Not listed';
+  const image = $('#fitgirl-detail-image');
+  const placeholder = $('#fitgirl-detail-placeholder');
+  image.hidden = !result.imageUrl;
+  placeholder.hidden = Boolean(result.imageUrl);
+  image.alt = result.title ? `${result.title} artwork` : 'Game artwork';
+  image.onerror = () => { image.hidden = true; placeholder.hidden = false; };
+  if (result.imageUrl) image.src = result.imageUrl;
+  else image.removeAttribute('src');
+}
+
+async function openFitGirlDetails(result) {
+  fitgirlSelectedResult = result;
+  updateFitGirlDetails(result);
+  const detailStatus = $('#fitgirl-detail-status');
+  detailStatus.textContent = '';
+  detailStatus.classList.remove('error');
+  const download = $('#fitgirl-detail-download');
+  download.disabled = false;
+  $('#fitgirl-detail-modal').hidden = false;
+  download.focus();
+  if (result.slug && (!result.description || !result.imageUrl || !result.sizeLabel || !result.downloadName)) {
+    detailStatus.textContent = 'Loading full repack details…';
+    download.disabled = true;
+    try {
+      const resolved = { ...result, ...await window.libraryApi.resolveFitGirl(result.slug) };
+      if (fitgirlSelectedResult !== result) return;
+      fitgirlSelectedResult = resolved;
+      updateFitGirlDetails(resolved);
+      detailStatus.textContent = '';
+    } catch (error) {
+      if (fitgirlSelectedResult !== result) return;
+      detailStatus.textContent = error.message || 'Unable to load full repack details.';
+      detailStatus.classList.add('error');
+    } finally {
+      if (fitgirlSelectedResult === result || fitgirlSelectedResult?.slug === result.slug) download.disabled = false;
+    }
+  }
+}
+
+async function downloadSelectedFitGirlResult() {
+  const result = fitgirlSelectedResult;
+  if (!result) return;
+  queueFitGirlDownload(result);
+  closeFitGirlDetails();
+}
+
+function fitgirlResultRow(result) {
+  const row = document.createElement('article');
+  row.className = 'fitgirl-game-row';
+  row.tabIndex = 0;
+  row.setAttribute('role', 'button');
+  row.setAttribute('aria-label', `View details for ${result.title || 'game'}`);
+  const imageFrame = document.createElement('div');
+  imageFrame.className = 'fitgirl-row-art';
+  if (result.imageUrl) {
+    const image = document.createElement('img');
+    image.src = result.imageUrl;
+    image.alt = '';
+    image.loading = 'lazy';
+    image.onerror = () => {
+      const fallback = document.createElement('span');
+      fallback.textContent = 'GAME';
+      imageFrame.replaceChildren(fallback);
+    };
+    imageFrame.append(image);
+  } else {
+    const fallback = document.createElement('span');
+    fallback.textContent = 'GAME';
+    imageFrame.append(fallback);
+  }
+  const meta = document.createElement('div');
+  meta.className = 'fitgirl-item-meta';
+  const title = document.createElement('h3');
+  title.textContent = result.title || 'Untitled repack';
+  const sub = document.createElement('p');
+  sub.textContent = [result.sizeLabel, result.downloadName].filter(Boolean).join(' · ') || 'Select to view repack details';
+  meta.append(title, sub);
+
+  const actions = document.createElement('div');
+  actions.className = 'fitgirl-row-actions';
+
+  const downloadBtn = document.createElement('button');
+  downloadBtn.className = 'button-small primary fitgirl-download-btn';
+  downloadBtn.innerHTML = '📥 Download';
+  downloadBtn.title = `Add ${result.title || 'repack'} to download queue`;
+  downloadBtn.addEventListener('click', (event) => {
+    event.stopPropagation();
+    queueFitGirlDownload(result);
+  });
+
+  const detailsBtn = document.createElement('button');
+  detailsBtn.className = 'button-small quiet fitgirl-details-btn';
+  detailsBtn.textContent = 'Details →';
+  detailsBtn.title = 'View repack details';
+  detailsBtn.addEventListener('click', (event) => {
+    event.stopPropagation();
+    openFitGirlDetails(result);
+  });
+
+  actions.append(downloadBtn, detailsBtn);
+  row.append(imageFrame, meta, actions);
+  row.addEventListener('click', () => openFitGirlDetails(result));
+  row.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      openFitGirlDetails(result);
+    }
+  });
+  return row;
+}
+
+function renderFitGirlResults(items, emptyText = 'No repacks found.') {
+  const container = $('#fitgirl-results');
+  container.replaceChildren();
+  if (!items.length) {
+    const empty = document.createElement('p');
+    empty.className = 'empty';
+    empty.textContent = emptyText;
+    container.append(empty);
+    return;
+  }
+  for (const item of items) container.append(fitgirlResultRow(item));
+}
+
+async function loadFitGirlTop(period) {
+  const month = period === 'month';
+  $('#fitgirl-top-month').classList.toggle('active', month);
+  $('#fitgirl-top-year').classList.toggle('active', !month);
+  fitgirlMessage(month ? 'Loading top repacks of the month…' : 'Loading top repacks of the year…');
+  try {
+    const games = await window.libraryApi.fitgirlTop(period);
+    renderFitGirlResults(games, 'No top repacks were available right now.');
+    fitgirlMessage(`${games.length} top repack${games.length === 1 ? '' : 's'} loaded.`);
+  } catch (error) {
+    renderFitGirlResults([]);
+    fitgirlMessage(error.message || 'Unable to load top repacks.', true);
+  }
+}
+
+async function performFitGirlSearch() {
+  const query = $('#fitgirl-search').value.trim();
+  if (!query) { fitgirlMessage('Enter a game name to search.', true); return; }
+  fitgirlMessage(`Searching FitGirl for "${query}"…`);
+  try {
+    const results = await window.libraryApi.searchFitGirl(query);
+    renderFitGirlResults(results, `No FitGirl repacks matched "${query}".`);
+    fitgirlMessage(results.length ? `${results.length} repack${results.length === 1 ? '' : 's'} found.` : 'No repacks matched your search.');
+  } catch (error) {
+    renderFitGirlResults([]);
+    fitgirlMessage(error.message || 'Unable to search FitGirl.', true);
+  }
+}
+
+async function addFitGirlToTorbox() {
+  if (!$('#fitgirl-auth-checked').checked) { fitgirlMessage('Confirm that you are authorized to download this content first.', true); return; }
+  if (!fitgirlPendingMagnet) { fitgirlMessage('Nothing is selected to add.', true); return; }
+  const add = $('#fitgirl-add');
+  add.disabled = true;
+  add.textContent = 'Adding…';
+  try {
+    if (!torboxSettings) { try { torboxSettings = await window.libraryApi.getTorboxSettings(); } catch { torboxSettings = null; } }
+    let destination = torboxSettings?.destination || '';
+    if (!destination) destination = await window.libraryApi.chooseTorboxDirectory();
+    if (!destination) throw new Error('Choose a download directory for this repack.');
+    await window.libraryApi.addTorboxMagnet({ magnet: fitgirlPendingMagnet, destination, title: fitgirlPendingTitle });
+    $('#fitgirl-authorization').hidden = true;
+    const name = fitgirlPendingTitle;
+    fitgirlPendingMagnet = null;
+    fitgirlMessage(`"${name}" added to Torbox. Open Downloads to track it.`);
+  } catch (error) {
+    fitgirlMessage(error.message || 'Unable to add the repack to Torbox.', true);
+  } finally {
+    add.disabled = false;
+    add.textContent = 'Add to Torbox';
+  }
 }
 
 async function selectGame(game) {
+  if (fastMediaCopyRequestId) {
+    $('#status').textContent = 'Finish or cancel the current fast-storage copy before selecting another game.';
+    return;
+  }
   const saved = await window.libraryApi.getLauncher(game.id);
   const config = saved || {
     runner: game.source === 'Steam' ? 'steam' : 'wine',
@@ -411,8 +963,28 @@ async function selectGame(game) {
     noFsync: false,
     dxvkHud: '',
     store: '',
-    umuGameId: ''
+    umuGameId: '',
+    debugLogging: false,
+    enableFsr: false,
+    fsrStrength: '2',
+    amdVulkanDriver: 'default',
+    enableNvapi: false,
+    hideNvidiaGpu: false,
+    enableRdnaRayTracing: false,
+    enableMesaGlThread: false,
+    largeAddressAware: false,
+    dxvkAsync: false
   };
+  config.debugLogging = Boolean(config.debugLogging);
+  config.enableFsr = Boolean(config.enableFsr);
+  config.fsrStrength = config.fsrStrength !== undefined && config.fsrStrength !== '' ? String(config.fsrStrength) : '2';
+  config.amdVulkanDriver = config.amdVulkanDriver || 'default';
+  config.enableNvapi = Boolean(config.enableNvapi);
+  config.hideNvidiaGpu = Boolean(config.hideNvidiaGpu);
+  config.enableRdnaRayTracing = Boolean(config.enableRdnaRayTracing);
+  config.enableMesaGlThread = Boolean(config.enableMesaGlThread);
+  config.largeAddressAware = Boolean(config.largeAddressAware);
+  config.dxvkAsync = Boolean(config.dxvkAsync);
   if (libraryData?.hostPlatform === 'win32' && !['steam', 'native'].includes(config.runner)) config.runner = game.source === 'Steam' ? 'steam' : 'native';
   if (libraryData?.hostPlatform === 'linux' && config.runner === 'proton') {
     config.protonPath ||= libraryData.protonSettings?.protonPath || '';
@@ -487,11 +1059,196 @@ function renderLauncher(game, config) {
     : '<p class="hint">Steam launches this game with the Proton version and compatibility settings already configured in Steam.</p>');
   else {
     const exeRow = document.createElement('div'); exeRow.className = 'executable-row';
-    exeRow.append(input('Executable', config.executable, value => { config.executable = value; }, '/path/to/game.exe'));
+    exeRow.append(input('Executable', config.executable, value => { config.executable = value; config.fastMedia = null; }, '/path/to/game.exe'));
     const pick = document.createElement('button'); pick.textContent = 'Choose';
-    pick.addEventListener('click', async () => { const chosen = await window.libraryApi.chooseExecutable(); if (chosen) { config.executable = chosen; renderLauncher(game, config); } });
+    pick.addEventListener('click', async () => { const chosen = await window.libraryApi.chooseExecutable(); if (chosen) { config.executable = chosen; config.fastMedia = null; renderLauncher(game, config); } });
     exeRow.append(pick); panel.append(exeRow);
-    panel.append(input('Working directory', config.workingDirectory, value => { config.workingDirectory = value; }, game.path));
+    panel.append(input('Working directory', config.workingDirectory, value => { config.workingDirectory = value; config.fastMedia = null; }, game.path));
+    if (libraryData?.hostPlatform === 'linux' && game.source === 'Server folder') {
+      const fastMediaPanel = document.createElement('div');
+      fastMediaPanel.className = 'fast-media-panel';
+      const fastMediaHeading = document.createElement('strong');
+      fastMediaHeading.textContent = 'Fast storage';
+      const fastMediaDescription = document.createElement('p');
+      fastMediaDescription.className = 'muted';
+      fastMediaDescription.textContent = 'Copy this game to an SSD/NVMe once, then launch from the staged copy. Refresh creates a new copy and keeps previous versions so a running game is not disturbed. Some games store saves beside the executable; staged-copy saves are not synced back to the original.';
+      const fastMediaToggleLabel = document.createElement('label');
+      fastMediaToggleLabel.className = 'fast-media-toggle';
+      const fastMediaToggle = document.createElement('input');
+      fastMediaToggle.type = 'checkbox';
+      fastMediaToggle.checked = Boolean(config.fastMedia?.active && config.fastMedia?.stagedExecutable);
+      const fastMediaToggleText = document.createElement('span');
+      fastMediaToggleText.textContent = 'Launch this game from fast storage';
+      fastMediaToggleLabel.append(fastMediaToggle, fastMediaToggleText);
+      const fastMediaStatus = document.createElement('p');
+      fastMediaStatus.id = 'fast-media-status';
+      fastMediaStatus.className = 'fast-media-status';
+      if (config.fastMedia?.active) {
+        fastMediaStatus.textContent = `Launching staged copy from ${config.fastMedia.root}`;
+      } else if (config.fastMedia?.stagedExecutable) {
+        fastMediaStatus.textContent = `A staged copy is available at ${config.fastMedia.root}; this game currently launches from its original location.`;
+      } else {
+        fastMediaStatus.textContent = 'This game currently launches from its original location.';
+      }
+      const progressRow = document.createElement('div');
+      progressRow.className = 'fast-media-progress';
+      const progress = document.createElement('progress');
+      progress.id = 'fast-media-progress';
+      progress.max = 100;
+      progress.value = 0;
+      progress.hidden = true;
+      const progressLabel = document.createElement('span');
+      progressLabel.id = 'fast-media-progress-label';
+      progressRow.append(progress, progressLabel);
+      const stageActions = document.createElement('div');
+      stageActions.className = 'launcher-actions';
+      const stage = document.createElement('button');
+      stage.className = 'primary';
+      stage.textContent = config.fastMedia?.stagedExecutable ? 'Refresh staged copy' : 'Copy to fast storage';
+      const chooseFastStorage = document.createElement('button');
+      chooseFastStorage.textContent = 'Choose fast-storage folder';
+      const cancelCopy = document.createElement('button');
+      cancelCopy.textContent = 'Cancel copy';
+      cancelCopy.hidden = true;
+      stage.addEventListener('click', async () => {
+        if (fastMediaCopyRequestId) return;
+        if (!window.confirm('This copies the game folder to fast storage and launches from that copy. Games that save settings or progress beside the executable may keep those files only in the staged copy; the app does not sync saves between copies. Continue?')) {
+          fastMediaToggle.checked = Boolean(config.fastMedia?.active && config.fastMedia?.stagedExecutable);
+          return;
+        }
+        try {
+          const destinationRoot = config.fastMedia?.destinationRoot || config.fastMedia?.root || await window.libraryApi.chooseFastStorage();
+          if (!destinationRoot) {
+            fastMediaToggle.checked = Boolean(config.fastMedia?.active && config.fastMedia?.stagedExecutable);
+            return;
+          }
+          const activateStagedCopy = fastMediaToggle.checked;
+          const requestId = `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+          fastMediaCopyRequestId = requestId;
+          const panelControls = [...panel.querySelectorAll('input, select, button')];
+          for (const control of panelControls) control.disabled = true;
+          stage.disabled = true;
+          cancelCopy.hidden = false;
+          cancelCopy.disabled = false;
+          progress.hidden = false;
+          progress.removeAttribute('value');
+          progressLabel.textContent = 'Scanning game files…';
+          fastMediaStatus.textContent = 'Preparing a persistent staged copy. Do not disconnect the selected drive.';
+          const sourceExecutable = config.fastMedia?.sourceExecutable || config.executable;
+          const sourceWorkingDirectory = config.fastMedia?.sourceWorkingDirectory || config.workingDirectory || game.path;
+          const staged = await window.libraryApi.stageGameToFastMedia({
+            requestId,
+            gameId: game.id,
+            sourcePath: game.path,
+            sourceExecutable,
+            sourceWorkingDirectory,
+            destinationRoot
+          });
+          config.fastMedia = {
+            root: staged.root,
+            destinationRoot: staged.root,
+            active: activateStagedCopy,
+            sourceExecutable: staged.sourceExecutable,
+            sourceWorkingDirectory: staged.sourceWorkingDirectory,
+            stagedExecutable: staged.executable,
+            stagedWorkingDirectory: staged.workingDirectory
+          };
+          config.executable = activateStagedCopy ? staged.executable : staged.sourceExecutable;
+          config.workingDirectory = activateStagedCopy ? staged.workingDirectory : staged.sourceWorkingDirectory;
+          try {
+            const saved = await window.libraryApi.saveLauncher(game, config);
+            Object.assign(config, saved);
+            $('#status').textContent = activateStagedCopy
+              ? `Staged ${game.name} on fast storage and enabled fast-storage launches.`
+              : `Staged ${game.name} on fast storage. It will continue launching from its original location until fast storage is enabled.`;
+          } catch (error) {
+            $('#status').textContent = `The staged copy completed, but launcher settings could not be saved: ${error.message || error}`;
+          }
+          renderLauncher(game, config);
+        } catch (error) {
+          fastMediaToggle.checked = Boolean(config.fastMedia?.active && config.fastMedia?.stagedExecutable);
+          fastMediaStatus.textContent = error.message || 'Unable to stage this game on fast storage.';
+          fastMediaStatus.classList.add('error');
+        } finally {
+          fastMediaCopyRequestId = null;
+          for (const control of panel.querySelectorAll('input, select, button')) control.disabled = false;
+          stage.disabled = false;
+          cancelCopy.hidden = true;
+          progress.hidden = true;
+          progress.value = 0;
+        }
+      });
+      chooseFastStorage.addEventListener('click', async () => {
+        if (fastMediaCopyRequestId) return;
+        const previous = config.fastMedia;
+        try {
+          const destinationRoot = await window.libraryApi.chooseFastStorage();
+          if (!destinationRoot) return;
+          config.fastMedia = {
+            root: previous?.root || '',
+            destinationRoot,
+            active: Boolean(previous?.active),
+            sourceExecutable: previous?.sourceExecutable || '',
+            sourceWorkingDirectory: previous?.sourceWorkingDirectory || '',
+            stagedExecutable: previous?.stagedExecutable || '',
+            stagedWorkingDirectory: previous?.stagedWorkingDirectory || ''
+          };
+          const saved = await window.libraryApi.saveLauncher(game, config);
+          Object.assign(config, saved);
+          renderLauncher(game, config);
+          $('#status').textContent = `Fast-storage destination saved for ${game.name}.`;
+        } catch (error) {
+          config.fastMedia = previous;
+          fastMediaStatus.textContent = error.message || 'Unable to save the fast-storage destination.';
+          fastMediaStatus.classList.add('error');
+        }
+      });
+      cancelCopy.addEventListener('click', async () => {
+        if (fastMediaCopyRequestId) {
+          cancelCopy.disabled = true;
+          try { await window.libraryApi.cancelFastMediaCopy(fastMediaCopyRequestId); }
+          catch (error) { fastMediaStatus.textContent = error.message || 'Unable to cancel the copy.'; }
+        }
+      });
+      fastMediaToggle.addEventListener('change', async () => {
+        if (fastMediaCopyRequestId) return;
+        if (fastMediaToggle.checked && !config.fastMedia?.stagedExecutable) {
+          stage.click();
+          return;
+        }
+        if (!config.fastMedia?.stagedExecutable) return;
+        const previousExecutable = config.executable;
+        const previousWorkingDirectory = config.workingDirectory;
+        const previousActive = config.fastMedia.active;
+        if (fastMediaToggle.checked) {
+          config.executable = config.fastMedia.stagedExecutable;
+          config.workingDirectory = config.fastMedia.stagedWorkingDirectory;
+          config.fastMedia.active = true;
+        } else {
+          config.executable = config.fastMedia.sourceExecutable;
+          config.workingDirectory = config.fastMedia.sourceWorkingDirectory;
+          config.fastMedia.active = false;
+        }
+        try {
+          const saved = await window.libraryApi.saveLauncher(game, config);
+          Object.assign(config, saved);
+          renderLauncher(game, config);
+          $('#status').textContent = fastMediaToggle.checked
+            ? `${game.name} will launch from its staged fast-storage copy.`
+            : `${game.name} will launch from its original location. The staged copy was kept.`;
+        } catch (error) {
+          config.executable = previousExecutable;
+          config.workingDirectory = previousWorkingDirectory;
+          config.fastMedia.active = previousActive;
+          fastMediaToggle.checked = previousActive;
+          fastMediaStatus.textContent = error.message || 'Unable to update the fast-storage launch setting.';
+          fastMediaStatus.classList.add('error');
+        }
+      });
+      stageActions.append(chooseFastStorage, stage, cancelCopy);
+      fastMediaPanel.append(fastMediaHeading, fastMediaDescription, fastMediaToggleLabel, fastMediaStatus, progressRow, stageActions);
+      panel.append(fastMediaPanel);
+    }
     if (config.runner === 'wine') {
       panel.append(input('Wine binary', config.wineBinary, value => { config.wineBinary = value; }, 'wine'));
       panel.append(input('Wine prefix (optional)', config.winePrefix, value => { config.winePrefix = value; }, '/path/to/prefix'));
@@ -704,8 +1461,12 @@ function updateLaunchStatus(statusObj) {
   const badge = $('#launch-status-badge');
   if (!badge) return;
   badge.className = `badge ${statusObj.state}`;
-  badge.textContent = statusObj.state.toUpperCase();
-  if (statusObj.state === 'starting' || statusObj.state === 'running') {
+  if (statusObj.state === 'delegated') {
+    badge.textContent = 'RUNNING IN STEAM';
+  } else {
+    badge.textContent = statusObj.state.toUpperCase();
+  }
+  if (statusObj.state === 'starting' || statusObj.state === 'running' || statusObj.state === 'delegated') {
     expandDebugDrawer();
   }
 }
@@ -735,6 +1496,9 @@ $('#steam-search-modal')?.addEventListener('click', (e) => {
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && $('#steam-search-modal') && !$('#steam-search-modal').hidden) {
     closeSteamSearchModal();
+  }
+  if (e.key === 'Escape' && $('#fitgirl-detail-modal') && !$('#fitgirl-detail-modal').hidden) {
+    closeFitGirlDetails();
   }
 });
 
@@ -819,10 +1583,60 @@ $('#source-filter').addEventListener('change', renderLibrary);
 $('#library-tab').addEventListener('click', () => switchView('library'));
 $('#downloads-tab').addEventListener('click', () => switchView('downloads'));
 $('#refresh-downloads').addEventListener('click', loadTorboxJobs);
+
+$('#fitgirl-tab').addEventListener('click', () => switchView('fitgirl'));
+$('#fitgirl-search-btn').addEventListener('click', performFitGirlSearch);
+$('#fitgirl-search').addEventListener('keydown', (e) => { if (e.key === 'Enter') void performFitGirlSearch(); });
+$('#fitgirl-top-month').addEventListener('click', () => void loadFitGirlTop('month'));
+$('#fitgirl-top-year').addEventListener('click', () => void loadFitGirlTop('year'));
+$('#fitgirl-add').addEventListener('click', addFitGirlToTorbox);
+$('#fitgirl-auth-cancel').addEventListener('click', () => {
+  $('#fitgirl-authorization').hidden = true;
+  fitgirlPendingMagnet = null;
+  fitgirlPendingTitle = '';
+});
+$('#fitgirl-detail-close').addEventListener('click', closeFitGirlDetails);
+$('#fitgirl-detail-close-secondary').addEventListener('click', closeFitGirlDetails);
+$('#fitgirl-detail-download').addEventListener('click', downloadSelectedFitGirlResult);
+$('#fitgirl-detail-modal').addEventListener('click', (event) => {
+  if (event.target === $('#fitgirl-detail-modal')) closeFitGirlDetails();
+});
 window.libraryApi.onTorboxProgress((progress) => {
   if (progress?.torrentId == null) return;
   if (progress.fileId != null) torboxProgress.set(`${progress.torrentId}:${progress.fileId}`, progress);
   if (isOverallProgress(progress)) torboxProgress.set(`${progress.torrentId}:overall`, progress);
   renderTorboxJobs();
 });
+if (window.libraryApi?.onFastMediaProgress) {
+  window.libraryApi.onFastMediaProgress((progress) => {
+    if (progress?.requestId !== fastMediaCopyRequestId) return;
+    const status = $('#fast-media-status');
+    const bar = $('#fast-media-progress');
+    const label = $('#fast-media-progress-label');
+    if (!status || !bar || !label) return;
+    status.classList.remove('error');
+    if (progress.state === 'scanning') {
+      bar.removeAttribute('value');
+      label.textContent = 'Scanning game files…';
+      return;
+    }
+    if (progress.state === 'complete') {
+      bar.value = 100;
+      label.textContent = 'Finalizing staged copy…';
+      return;
+    }
+    const total = Number(progress.totalBytes || 0);
+    const copied = Number(progress.copiedBytes || 0);
+    if (total > 0) {
+      bar.value = Math.min(100, Math.round(copied / total * 100));
+      label.textContent = `${formatBytes(copied)} / ${formatBytes(total)}${progress.relativePath ? ` · ${progress.relativePath}` : ''}`;
+    } else {
+      bar.value = 100;
+      label.textContent = 'Copying game files…';
+    }
+    status.textContent = 'Copying the game to fast storage. You can cancel safely; the original stays untouched.';
+  });
+}
+loadDownloadQueue();
+renderDownloadQueue();
 load();

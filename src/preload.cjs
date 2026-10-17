@@ -5,6 +5,9 @@ contextBridge.exposeInMainWorld('libraryApi', {
   discoverMetadata: () => ipcRenderer.invoke('library:discover-metadata'),
   applyStoreAppId: (game, appId) => ipcRenderer.invoke('library:apply-store-app-id', game, appId),
   searchSteamStore: (query) => ipcRenderer.invoke('library:search-steam-store', query),
+  searchFitGirl: (query) => ipcRenderer.invoke('fitgirl:search', query),
+  fitgirlTop: (period) => ipcRenderer.invoke('fitgirl:top', period),
+  resolveFitGirl: (slug) => ipcRenderer.invoke('fitgirl:resolve', slug),
   chooseFolder: () => ipcRenderer.invoke('library:choose-folder'),
   addFolder: (folder) => ipcRenderer.invoke('library:add-folder', folder),
   removeFolder: (folder) => ipcRenderer.invoke('library:remove-folder', folder),
@@ -28,6 +31,14 @@ contextBridge.exposeInMainWorld('libraryApi', {
   listGeReleases: () => ipcRenderer.invoke('settings:list-ge-releases'),
   installGeProton: (version) => ipcRenderer.invoke('settings:install-ge-proton', version),
   chooseExecutable: () => ipcRenderer.invoke('launcher:choose-executable'),
+  chooseFastStorage: () => ipcRenderer.invoke('launcher:choose-fast-storage'),
+  stageGameToFastMedia: (request) => ipcRenderer.invoke('launcher:stage-game', request),
+  cancelFastMediaCopy: (requestId) => ipcRenderer.invoke('launcher:cancel-fast-media-copy', requestId),
+  onFastMediaProgress: (callback) => {
+    const listener = (_event, progress) => callback(progress);
+    ipcRenderer.on('launcher:fast-media-progress', listener);
+    return () => ipcRenderer.removeListener('launcher:fast-media-progress', listener);
+  },
   getLauncher: (gameId) => ipcRenderer.invoke('launcher:get', gameId),
   saveLauncher: (game, configuration) => ipcRenderer.invoke('launcher:save', game, configuration),
   previewLaunch: (game, configuration) => ipcRenderer.invoke('launcher:preview', game, configuration),

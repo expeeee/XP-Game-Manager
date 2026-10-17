@@ -6,7 +6,8 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
-const { performanceSettings, splitArguments, checksumAssetName } = require('./launcher-config.cjs');
+const { performanceSettings, splitArguments, checksumAssetName, decodeHtmlEntities, parseFitGirlRepack, parseFitGirlArtwork, fitGirlPlainText, parseFitGirlTopList, generateGameFolderName } = require('./launcher-config.cjs');
+const { copyGameFiles } = require('./fast-media.cjs');
 const { Readable, Transform } = require('stream');
 const { pipeline } = require('stream/promises');
 
@@ -28,6 +29,7 @@ const WEB_ONLY = process.env.XPGM_WEB_ONLY === '1' || process.env.LGM_WEB_ONLY =
 let metadataDiscovery = null;
 let legacySettingsMigrated = false;
 const torboxDownloadLocks = new Set();
+const fastMediaCopies = new Map();
 let torboxJobWriteQueue = Promise.resolve();
 async function migrateLegacySettings() { if (legacySettingsMigrated || LEGACY_SETTINGS_DIR === SETTINGS_DIR) return; legacySettingsMigrated = true; for (const filename of ['settings.json', 'game-launchers.json', 'game-metadata.json']) { try { await fs.access(path.join(SETTINGS_DIR, filename)); } catch { try { await fs.mkdir(SETTINGS_DIR, { recursive: true }); await fs.copyFile(path.join(LEGACY_SETTINGS_DIR, filename), path.join(SETTINGS_DIR, filename)); } catch {} } } }
 
@@ -280,9 +282,11 @@ async function readGameManifest(gamePath) {
 
 async function writeGameManifest(game, configuration) {
   if (game?.source !== 'Server folder' || typeof game.path !== 'string') return;
-  const executable = relativeGamePath(game.path, configuration.executable);
+  const executableCandidate = configuration.fastMedia?.sourceExecutable || configuration.executable;
+  const executable = relativeGamePath(game.path, executableCandidate);
   if (!executable) return;
-  const workingDirectory = relativeGamePath(game.path, configuration.workingDirectory) || '.';
+  const workingDirCandidate = configuration.fastMedia?.sourceWorkingDirectory || configuration.workingDirectory;
+  const workingDirectory = relativeGamePath(game.path, workingDirCandidate) || '.';
   const current = await readGameManifestDocument(game.path);
   const manifest = {
     schemaVersion: 1,
@@ -443,6 +447,89 @@ async function searchSteamStoreApi(query) {
     name: item.name,
     tiny_image: item.tiny_image || `https://cdn.akamai.steamstatic.com/steam/apps/${item.id}/header.jpg`
   }));
+}
+
+// --- FitGirl Repacks catalog (read-only discovery; download via Torbox) ---
+const FITGIRL_API = 'https://fitgirl-repacks.site/wp-json/wp/v2';
+const FITGIRL_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
+
+async function fitgirlFetch(url) {
+  const response = await fetch(url, { signal: AbortSignal.timeout(30000), headers: { 'User-Agent': FITGIRL_UA, 'Accept': 'text/html,application/json' } });
+  if (!response.ok) throw new Error(`FitGirl request failed (${response.status}).`);
+  return response;
+}
+
+function fitgirlResult(post, link) {
+  const title = decodeHtmlEntities(post.title?.rendered || '');
+  const repack = parseFitGirlRepack(post.content?.rendered || '');
+  return {
+    id: post.id,
+    title,
+    url: link || post.link || '',
+    infoHash: repack?.infoHash || '',
+    downloadName: repack?.downloadName || '',
+    sizeLabel: repack?.sizeLabel || '',
+    imageUrl: parseFitGirlArtwork(post.content?.rendered || ''),
+    description: fitGirlPlainText(post.excerpt?.rendered || ''),
+    magnet: repack?.magnet || ''
+  };
+}
+
+async function searchFitGirlRepacks(query) {
+  const term = String(query || '').trim();
+  if (!term) throw new Error('Enter a game name to search.');
+  const payload = await (await fitgirlFetch(`${FITGIRL_API}/posts?search=${encodeURIComponent(term)}&per_page=25&_fields=id,link,title,content,excerpt`)).json();
+  if (!Array.isArray(payload)) return [];
+  return payload
+    .filter((post) => !/updates digest/i.test(post.title?.rendered || ''))
+    .map((post) => fitgirlResult(post))
+    .filter((result) => result.infoHash);
+}
+
+const FITGIRL_TOP_PAGES = {
+  month: 'https://fitgirl-repacks.site/pop-repacks/',
+  year: 'https://fitgirl-repacks.site/popular-repacks-of-the-year/'
+};
+
+async function fetchFitGirlTopList(period) {
+  const url = FITGIRL_TOP_PAGES[period] || FITGIRL_TOP_PAGES.month;
+  const html = await (await fitgirlFetch(url)).text();
+  const games = parseFitGirlTopList(html);
+  if (!games.length) return games;
+
+  try {
+    const artworkBySlug = new Map();
+    const batchSize = 50;
+    for (let i = 0; i < games.length; i += batchSize) {
+      const batch = games.slice(i, i + batchSize);
+      const query = new URLSearchParams();
+      for (const game of batch) query.append('slug[]', game.slug);
+      query.set('per_page', String(batch.length));
+      query.set('_fields', 'slug,content');
+      try {
+        const response = await fitgirlFetch(`${FITGIRL_API}/posts?${query}`);
+        const payload = await response.json();
+        if (Array.isArray(payload)) {
+          for (const post of payload) {
+            artworkBySlug.set(post.slug, parseFitGirlArtwork(post.content?.rendered || ''));
+          }
+        }
+      } catch {}
+    }
+    return games.map((game) => ({ ...game, imageUrl: game.imageUrl || artworkBySlug.get(game.slug) || '' }));
+  } catch {
+    return games;
+  }
+}
+
+async function resolveFitGirlRepack(slug) {
+  const value = String(slug || '').trim();
+  if (!/^[a-z0-9-]+$/.test(value)) throw new Error('Choose a FitGirl repack to resolve.');
+  const payload = await (await fitgirlFetch(`${FITGIRL_API}/posts?slug=${encodeURIComponent(value)}&_fields=id,link,title,content,excerpt`)).json();
+  if (!Array.isArray(payload) || !payload.length) throw new Error('That FitGirl repack could not be found.');
+  const result = fitgirlResult(payload[0]);
+  if (!result.infoHash) throw new Error('No download link was available for that repack yet.');
+  return result;
 }
 
 async function discoverCompatibilityTools() {
@@ -736,6 +823,17 @@ function safeDownloadName(name, fallback) {
   return base && base !== '.' && base !== '..' ? base.slice(0, 180) : fallback;
 }
 
+function safeDownloadRelativePath(name, fallback) {
+  if (!name || typeof name !== 'string') return safeDownloadName(fallback, fallback);
+  const normalized = path.normalize(name.replace(/\\/g, '/'));
+  if (normalized.startsWith('..') || normalized.includes('../') || path.isAbsolute(normalized)) {
+    return safeDownloadName(fallback, fallback);
+  }
+  const parts = normalized.split('/').map((p) => safeDownloadName(p, '')).filter(Boolean);
+  if (!parts.length) return safeDownloadName(fallback, fallback);
+  return path.join(...parts);
+}
+
 async function recordTorboxFileSaved(torrentId, fileId, result) {
   await updateTorboxJobs((jobs) => {
     const job = jobs.find((item) => item.torrentId === torrentId);
@@ -762,8 +860,10 @@ async function downloadTorboxFileFromJob(job, fileId, report = null) {
   if (!response.ok || payload?.success === false) throw new Error(torboxError(payload, `Torbox download-link request failed (${response.status}).`));
   const downloadUrl = typeof (payload?.data ?? payload) === 'string' ? (payload.data ?? payload) : (payload?.data?.url || payload?.url);
   if (!downloadUrl || !/^https:\/\//i.test(downloadUrl)) throw new Error('Torbox did not return a usable download link.');
-  const destination = path.resolve(downloadDirectory, safeDownloadName(file.name, `torbox-${job.torrentId}-${file.id}`));
-  if (path.dirname(destination) !== downloadDirectory) throw new Error('The requested file name is unsafe.');
+  const relativePath = safeDownloadRelativePath(file.name, `torbox-${job.torrentId}-${file.id}`);
+  const destination = path.resolve(downloadDirectory, relativePath);
+  if (!isContainedPath(downloadDirectory, destination)) throw new Error('The requested file name is unsafe.');
+  await fs.mkdir(path.dirname(destination), { recursive: true });
   try { await fs.access(destination); throw new Error(`${path.basename(destination)} already exists. Rename or move it before downloading.`); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   const partial = `${destination}.${crypto.randomUUID()}.part`;
   const fileResponse = await fetch(downloadUrl, { redirect: 'follow' });
@@ -917,17 +1017,52 @@ ipcMain.handle('torbox:add-magnet', async (_event, configuration) => {
   const created = await torboxRequest('/torrents/createtorrent', { method: 'POST', body });
   const candidate = Array.isArray(created) ? created[0] : created;
   const job = torboxJob(candidate, { status: 'queued', files: [] });
+
+  let preferredTitle = typeof configuration?.title === 'string' ? configuration.title.trim() : '';
+  if (!preferredTitle) {
+    try {
+      const parsedMagnet = new URL(magnet);
+      preferredTitle = parsedMagnet.searchParams.get('dn') || '';
+    } catch {}
+  }
+  if (!preferredTitle) {
+    preferredTitle = job.name || '';
+  }
+  if (preferredTitle && (!job.name || /^Torrent \d+$/i.test(job.name))) {
+    job.name = preferredTitle;
+  }
+
+  const baseFolderName = generateGameFolderName(preferredTitle, `torbox-${job.torrentId}`);
   const root = await fs.realpath(destinationRoot);
-  const destination = path.resolve(root, `${safeDownloadName(job.name, 'torbox')}-${job.torrentId}`);
-  if (!isContainedPath(root, destination)) throw new Error('Torbox returned an unsafe torrent name.');
+  let folderName = baseFolderName;
+  let destination = path.resolve(root, folderName);
+  if (!isContainedPath(root, destination)) {
+    folderName = `torbox-${job.torrentId}`;
+    destination = path.resolve(root, folderName);
+  }
+
   const jobs = await readTorboxJobs();
   const index = jobs.findIndex((item) => item.torrentId === job.torrentId);
   if (index >= 0) return jobs[index];
-  try { await fs.mkdir(destination); }
-  catch (error) {
-    if (error.code === 'EEXIST') throw new Error('A download directory for this Torbox item already exists. Choose a different destination directory.');
-    throw error;
+
+  let counter = 2;
+  while (true) {
+    try {
+      await fs.mkdir(destination);
+      break;
+    } catch (error) {
+      if (error.code === 'EEXIST') {
+        folderName = `${baseFolderName} (${counter++})`;
+        destination = path.resolve(root, folderName);
+        if (!isContainedPath(root, destination)) {
+          throw new Error('Could not create a safe download directory.');
+        }
+      } else {
+        throw error;
+      }
+    }
   }
+
   const resolvedDestination = await fs.realpath(destination);
   if (!isContainedPath(root, resolvedDestination)) throw new Error('The Torbox download directory must not be a symbolic link.');
   job.destinationRoot = root;
@@ -1092,6 +1227,9 @@ async function diagnoseSystemHealth() {
 ipcMain.handle('system:diagnose-health', async () => diagnoseSystemHealth());
 ipcMain.handle('settings:discover-proton-tools', async () => discoverCompatibilityTools());
 ipcMain.handle('library:search-steam-store', async (_event, query) => searchSteamStoreApi(query));
+ipcMain.handle('fitgirl:search', async (_event, query) => searchFitGirlRepacks(query));
+ipcMain.handle('fitgirl:top', async (_event, period) => fetchFitGirlTopList(period));
+ipcMain.handle('fitgirl:resolve', async (_event, slug) => resolveFitGirlRepack(slug));
 
 ipcMain.handle('launcher:choose-executable', async () => {
   const result = await dialog.showOpenDialog({
@@ -1103,6 +1241,93 @@ ipcMain.handle('launcher:choose-executable', async () => {
 });
 
 ipcMain.handle('launcher:get', async (_event, gameId) => (await readGameSettings())[gameId] || null);
+
+ipcMain.handle('launcher:choose-fast-storage', async () => {
+  const result = await dialog.showOpenDialog({
+    title: 'Choose fast storage for staged games',
+    properties: ['openDirectory', 'createDirectory']
+  });
+  return result.canceled ? null : result.filePaths[0];
+});
+
+ipcMain.handle('launcher:stage-game', async (event, request) => {
+  if (process.platform !== 'linux') throw new Error('Fast-media staging is currently available on Linux only.');
+  const requestId = typeof request?.requestId === 'string' ? request.requestId : '';
+  const gameId = typeof request?.gameId === 'string' ? request.gameId : '';
+  if (!/^[A-Za-z0-9-]{1,80}$/.test(requestId) || !gameId.startsWith('folder:') || fastMediaCopies.has(requestId)) {
+    throw new Error('Invalid or duplicate fast-media copy request.');
+  }
+  const sourcePath = typeof request.sourcePath === 'string' ? request.sourcePath : '';
+  if (!sourcePath || path.resolve(gameId.slice('folder:'.length)) !== path.resolve(sourcePath)) {
+    throw new Error('Fast-media staging is limited to the selected folder game.');
+  }
+  const sourceExecutableValue = typeof request.sourceExecutable === 'string' ? request.sourceExecutable : '';
+  const sourceWorkingDirectoryValue = typeof request.sourceWorkingDirectory === 'string' ? request.sourceWorkingDirectory : '';
+  const destinationValue = typeof request.destinationRoot === 'string' ? request.destinationRoot : '';
+  if (!sourceExecutableValue || !destinationValue) throw new Error('Select a game executable and fast-storage folder first.');
+
+  const controller = new AbortController();
+  fastMediaCopies.set(requestId, controller);
+  const reportProgress = (progress) => {
+    if (!event.sender.isDestroyed()) event.sender.send('launcher:fast-media-progress', { requestId, ...progress });
+  };
+  let temporaryPath = '';
+  try {
+    const sourceRoot = await fs.realpath(sourcePath);
+    if (!(await fs.stat(sourceRoot)).isDirectory()) throw new Error('The game source must be a directory.');
+    const sourceExecutable = await fs.realpath(path.resolve(sourceExecutableValue));
+    if (!isContainedPath(sourceRoot, sourceExecutable)) throw new Error('The selected executable resolves outside the game folder.');
+    if (!(await fs.stat(sourceExecutable)).isFile()) throw new Error('Choose a game executable file inside the game folder.');
+    const sourceWorkingDirectoryPath = path.resolve(sourceWorkingDirectoryValue || path.dirname(sourceExecutable));
+    const sourceWorkingDirectory = await fs.realpath(sourceWorkingDirectoryPath);
+    if (sourceWorkingDirectory !== sourceRoot && !isContainedPath(sourceRoot, sourceWorkingDirectory)) {
+      throw new Error('The working directory resolves outside the game folder.');
+    }
+    if (!(await fs.stat(sourceWorkingDirectory)).isDirectory()) throw new Error('The game working directory is unavailable.');
+
+    const destinationRoot = await fs.realpath(destinationValue);
+    if (!(await fs.stat(destinationRoot)).isDirectory()) throw new Error('Choose an available fast-storage directory.');
+    const gameKey = crypto.createHash('sha256').update(gameId).digest('hex').slice(0, 20);
+    const gameCacheRoot = path.join(destinationRoot, 'XP-Game-Manager', gameKey);
+    if (gameCacheRoot === sourceRoot || isContainedPath(sourceRoot, gameCacheRoot)) {
+      throw new Error('Choose fast storage outside the game folder.');
+    }
+    await fs.mkdir(gameCacheRoot, { recursive: true });
+    const realGameCacheRoot = await fs.realpath(gameCacheRoot);
+    if (!isContainedPath(destinationRoot, realGameCacheRoot) || realGameCacheRoot === sourceRoot || isContainedPath(sourceRoot, realGameCacheRoot)) {
+      throw new Error('The fast-storage cache path must be a real directory outside the game folder.');
+    }
+    await fs.access(realGameCacheRoot, fsSync.constants.W_OK);
+    const versionName = `${Date.now()}-${crypto.randomUUID()}`;
+    temporaryPath = path.join(realGameCacheRoot, `.copying-${versionName}`);
+    const stagedPath = path.join(realGameCacheRoot, versionName);
+    await copyGameFiles(sourceRoot, temporaryPath, controller.signal, reportProgress);
+    if (controller.signal.aborted) throw controller.signal.reason || new Error('Fast-media copy cancelled.');
+    await fs.rename(temporaryPath, stagedPath);
+    temporaryPath = '';
+    const executableRelativePath = path.relative(sourceRoot, sourceExecutable);
+    const workingDirectoryRelativePath = path.relative(sourceRoot, sourceWorkingDirectory);
+    return {
+      root: destinationRoot,
+      sourceExecutable,
+      sourceWorkingDirectory,
+      executable: path.join(stagedPath, executableRelativePath),
+      workingDirectory: path.join(stagedPath, workingDirectoryRelativePath)
+    };
+  } catch (error) {
+    if (temporaryPath) await fs.rm(temporaryPath, { recursive: true, force: true });
+    if (controller.signal.aborted) throw new Error('Fast-media copy cancelled.');
+    throw error;
+  } finally {
+    fastMediaCopies.delete(requestId);
+  }
+});
+
+ipcMain.handle('launcher:cancel-fast-media-copy', async (_event, requestId) => {
+  const controller = fastMediaCopies.get(requestId);
+  if (controller && !controller.signal.aborted) controller.abort();
+  return Boolean(controller);
+});
 
 ipcMain.handle('launcher:save', async (_event, game, configuration) => {
   const gameId = game?.id;
@@ -1134,10 +1359,25 @@ ipcMain.handle('launcher:save', async (_event, game, configuration) => {
     noFsync: Boolean(configuration.noFsync),
     dxvkHud: typeof configuration.dxvkHud === 'string' ? configuration.dxvkHud : '',
     store: typeof configuration.store === 'string' ? configuration.store : '',
-    umuGameId: typeof configuration.umuGameId === 'string' ? configuration.umuGameId : ''
+    umuGameId: typeof configuration.umuGameId === 'string' ? configuration.umuGameId : '',
+    fastMedia: configuration.fastMedia && typeof configuration.fastMedia === 'object'
+      ? {
+        root: typeof configuration.fastMedia.root === 'string' ? configuration.fastMedia.root : '',
+        destinationRoot: typeof configuration.fastMedia.destinationRoot === 'string' ? configuration.fastMedia.destinationRoot : '',
+        active: Boolean(configuration.fastMedia.active),
+        sourceExecutable: typeof configuration.fastMedia.sourceExecutable === 'string' ? configuration.fastMedia.sourceExecutable : '',
+        sourceWorkingDirectory: typeof configuration.fastMedia.sourceWorkingDirectory === 'string' ? configuration.fastMedia.sourceWorkingDirectory : '',
+        stagedExecutable: typeof configuration.fastMedia.stagedExecutable === 'string' ? configuration.fastMedia.stagedExecutable : '',
+        stagedWorkingDirectory: typeof configuration.fastMedia.stagedWorkingDirectory === 'string' ? configuration.fastMedia.stagedWorkingDirectory : ''
+      }
+      : null
   };
   await saveGameSettings(settings);
-  await writeGameManifest(game, settings[gameId]);
+  try {
+    await writeGameManifest(game, settings[gameId]);
+  } catch {
+    // Game folder may reside on a read-only network mount; local settings are safely saved.
+  }
   return settings[gameId];
 });
 
@@ -1420,6 +1660,12 @@ ipcMain.handle('launcher:launch', async (_event, game, configuration) => {
       });
 
       child.once('exit', (code, signal) => {
+        const isSteamDelegated = spec.command === 'xdg-open' || (spec.args?.[0] && String(spec.args[0]).startsWith('steam://'));
+        if (isSteamDelegated && code === 0) {
+          broadcastStatus({ state: 'delegated', exitCode: code, command: printable, gameName: game.name });
+          broadcastLog({ type: 'system', text: `[${new Date().toLocaleTimeString()}] Launch delegated to Steam client.\n` });
+          return;
+        }
         const statusText = code !== null ? `exited with code ${code}` : `terminated by signal ${signal}`;
         broadcastStatus({ state: 'exited', exitCode: code, signal, command: printable, gameName: game.name });
         broadcastLog({ type: 'system', text: `[${new Date().toLocaleTimeString()}] Process ${statusText}.\n` });
